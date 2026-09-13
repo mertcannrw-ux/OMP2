@@ -155,6 +155,46 @@ created empty instead. Opting into junctioning is explicit:
 OMP_ALLOW_HEAVY_JUNCTION_WRITE=1
 ```
 
+### Context compaction
+
+Compaction shrinks what a provider sees without shrinking what the session knows. The
+journal keeps every element; a `summary_node` under `<summaries>` records only which body
+elements the projection leaves out, so the originals stay addressable and the model can
+read them back:
+
+```
+Read summary://            list the DAG (id, reach, tokens)
+Read summary://<id>        re-render the transcript elements that node elides
+Read summary://?q=<text>   search the elided originals before paying for an expansion
+```
+
+The pass is deterministic and runs as part of request derivation, in three stages that
+each strictly reduce the projection: **elide** the oldest completed turns into a leaf
+node (only when an element's inventory line costs less than the element itself),
+**condense** the oldest root nodes into one parent once there are more than eight, and
+**reduce** what is left — oversized tool arguments first (replaced by a marker), then tool
+output, then assistant text, then the user's own words, and never pinned instructions.
+Pinned instructions (`system`/`steering` elements, or any element with `pinned = true`)
+and the turn in flight are never elided. Every reduction the planner decides is one the
+projection actually performs, so the plan and the outgoing request cannot disagree.
+
+Two thresholds come from the provider metadata that already feeds `ai_context_length`:
+elision starts at `ai_compaction_threshold × context_length` and must finish below
+`context_length − ai_max_tokens − 1,024`. A session whose provider never advertises a
+window simply never compacts. The token estimate is a deterministic heuristic — four
+ASCII bytes per token, two tokens per non-ASCII character — that is never optimistic for
+any script, so replicas replaying the same journal reach the same decision and the reserve
+above only has to absorb the ASCII error.
+
+Deterministic elision is the default because the controlled evidence does not support
+automatic summarization: observation masking matched or beat LLM summarization at roughly
+half the cost across five model configurations, and on one of them summarization cost
+8.9 points of solve rate (arXiv 2508.21433); a frontier endpoint told its exact workload
+still answered set-membership queries at coin-flip accuracy after compacting (arXiv
+2608.01326). Nothing is lost by starting deterministic: a node's text is one
+`ReplaceText` patch away from carrying a model-written summary, and provider-native
+compaction items fit the existing `MessageFold::RemoteState` variant.
+
 ### ElasticSlots
 
 ElasticSlots is the streaming transcript protocol, decoupling three layers: semantic
@@ -176,7 +216,7 @@ The permanent roster is fixed at seven tools, plus dynamic discovery.
 
 | Tool | Purpose |
 | --- | --- |
-| `Read` | Reads files, internal URIs (`skill://`, `artifact://`), and URLs, with inline selectors (`:50`, `:50-200`, `:raw`). |
+| `Read` | Reads files, internal URIs (`skill://`, `artifact://`, `summary://`), and URLs, with inline selectors (`:50`, `:50-200`, `:raw`). |
 | `Bash` | Runs a shell command or pipeline under policy limits. |
 | `Write` | Creates or overwrites a file. |
 | `Edit` | Applies surgical edits in the hashline patch language. |

@@ -1,6 +1,7 @@
 pub mod agent_loop;
 mod children;
 pub mod command;
+pub mod compaction;
 pub mod convar;
 pub mod director;
 pub mod host;
@@ -8,6 +9,7 @@ mod provider_config;
 
 pub use agent_loop::*;
 pub use command::*;
+pub use compaction::*;
 pub use convar::*;
 pub use director::*;
 pub use host::*;

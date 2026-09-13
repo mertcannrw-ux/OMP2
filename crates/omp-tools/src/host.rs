@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,11 +16,11 @@ use omp_runtime::artifact::{
 };
 use omp_runtime::job::{Job, JobKind};
 use omp_runtime::workspace::{IsolationMode, WorkspaceView, WorkspaceViewId};
-use omp_state::Journal;
+use omp_state::{Journal, SessionSnapshot};
 use omp_types::{
     ActorId, ArtifactId, ElementId, ElementSnapshot, JournalOffset, LimitPolicy, Patch, PatchOp,
-    ProtocolVersion, SandboxCapability, SandboxRequest, SessionId, StructuredError,
-    TypedValue,
+    ProtocolVersion, SUMMARIES_CONTAINER, SandboxCapability, SandboxRequest, SessionId,
+    StructuredError, SummaryKind, SummaryNode, TypedValue, expand_covered,
 };
 
 use crate::autoqa::{AutoQaReport, ReportQualityFilter};
@@ -579,6 +579,7 @@ impl ToolHost {
             });
 
         match scheme {
+            ResourceScheme::Summary => self.handle_summary_read(journal, clean_target, &selector),
             ResourceScheme::Artifact => {
                 let artifact_id =
                     ArtifactId::new(clean_target).map_err(|e| ToolError::Validation {
@@ -873,6 +874,99 @@ impl ToolHost {
                 self.read_filesystem_resource(journal, clean_target, &selector, raw)
             }
         }
+    }
+
+    /// Reads the compaction DAG.
+    ///
+    /// * `summary://` lists every node.
+    /// * `summary://<id>` re-renders the transcript elements that node elides —
+    ///   the originals, not the inventory, which is what makes compaction
+    ///   lossless in practice.
+    /// * `summary://<id>?q=<pattern>` (or `summary://?q=<pattern>` across the
+    ///   whole DAG) searches the elided originals, so a model can decide what to
+    ///   expand without paying for the expansion first.
+    ///
+    /// Line selectors (`summary://<id>:50-200`) apply to the rendered expansion.
+    fn handle_summary_read(
+        &self,
+        journal: &Journal,
+        target: &str,
+        selector: &ReadSelector,
+    ) -> Result<HostResponse, ToolError> {
+        let snapshot = journal.snapshot();
+        let mut nodes: BTreeMap<ElementId, SummaryNode> = BTreeMap::new();
+        let mut order: Vec<ElementId> = Vec::new();
+        let mut texts: BTreeMap<ElementId, String> = BTreeMap::new();
+        let mut kinds: BTreeMap<ElementId, SummaryKind> = BTreeMap::new();
+        for element in snapshot.children(snapshot.container(SUMMARIES_CONTAINER)) {
+            let Ok(node) = SummaryNode::from_element(element) else {
+                continue;
+            };
+            order.push(element.id.clone());
+            texts.insert(element.id.clone(), element.text.clone());
+            kinds.insert(
+                element.id.clone(),
+                SummaryNode::kind_of(element).unwrap_or(SummaryKind::Leaf),
+            );
+            nodes.insert(element.id.clone(), node);
+        }
+        if order.is_empty() {
+            let present = snapshot
+                .children(snapshot.container(SUMMARIES_CONTAINER))
+                .count();
+            return Ok(HostResponse::success(if present == 0 {
+                "Nothing has been compacted in this session; the transcript is complete."
+            } else {
+                "This session has compaction nodes this build cannot decode; the transcript itself is unaffected."
+            }));
+        }
+
+        let scope: Vec<ElementId> = if target.is_empty() {
+            order.clone()
+        } else {
+            let id = ElementId::new(target).map_err(|_| {
+                ToolError::Validation {
+                    message: format!(
+                        "invalid summary id {target:?}: expected summary://<id> as listed by summary://"
+                    ),
+                    details: None,
+                }
+            })?;
+            if !nodes.contains_key(&id) {
+                return Err(ToolError::NotFound(format!(
+                    "No summary node {id} on this branch; run Read summary:// to list the DAG"
+                )));
+            }
+            vec![id]
+        };
+
+        if let Some(pattern) = selector.query.as_deref().filter(|q| !q.is_empty()) {
+            return Ok(HostResponse::success(render_summary_search(
+                snapshot, &nodes, &scope, pattern,
+            )));
+        }
+
+        if target.is_empty() {
+            return Ok(HostResponse::success(render_summary_list(
+                &nodes, &order, &texts, &kinds,
+            )));
+        }
+
+        let rendered = render_summary_expansion(snapshot, &nodes, &scope[0]);
+        let Some(lines) = &selector.lines else {
+            return Ok(HostResponse::success(rendered));
+        };
+        let collected: Vec<&str> = rendered.lines().collect();
+        let (selected, truncated) =
+            lines.select_lines_bounded(&collected, 4_000, MAX_READ_BYTES);
+        let mut out = String::new();
+        for (number, line) in selected {
+            out.push_str(&format!("{number}:{line}\n"));
+        }
+        if truncated {
+            out.push_str("[...selector output truncated]\n");
+        }
+        Ok(HostResponse::success(out))
     }
 
     /// Reads a local filesystem file or directory.
@@ -2978,6 +3072,175 @@ fn build_structural_summary(path: &str, tag: &str, lines: &[&str]) -> String {
     out
 }
 
+/// Maximum bytes of expansion or search output returned for one summary read.
+const MAX_SUMMARY_BYTES: usize = 64 * 1024;
+/// Maximum matches reported by one summary search.
+const MAX_SUMMARY_MATCHES: usize = 200;
+
+/// Lists the DAG: every node with its reach and the first line of its text.
+fn render_summary_list(
+    nodes: &BTreeMap<ElementId, SummaryNode>,
+    order: &[ElementId],
+    texts: &BTreeMap<ElementId, String>,
+    kinds: &BTreeMap<ElementId, SummaryKind>,
+) -> String {
+    let children: BTreeSet<ElementId> = nodes
+        .values()
+        .flat_map(|node| node.children.iter().cloned())
+        .collect();
+    let mut out = format!(
+        "# Compacted context: {} node(s). Expand originals with Read summary://<id>, search them with Read summary://?q=<pattern>\n",
+        order.len()
+    );
+    for id in order {
+        let node = nodes.get(id).cloned().unwrap_or_default();
+        let kind = kinds.get(id).map(|kind| kind.as_str()).unwrap_or("leaf");
+        let role = if children.contains(id) { "child" } else { "root" };
+        let first = texts
+            .get(id)
+            .and_then(|text| text.lines().nth(1))
+            .unwrap_or("")
+            .trim();
+        out.push_str(&format!(
+            "- summary://{id} — {kind}/{role}, {} elements, ~{} tokens\n    {first}\n",
+            expand_covered(nodes, id).len().max(node.covered.len()),
+            node.covered_tokens,
+        ));
+    }
+    out
+}
+
+/// Renders the original transcript elements a node elides, in body order.
+fn render_summary_expansion(
+    snapshot: &SessionSnapshot,
+    nodes: &BTreeMap<ElementId, SummaryNode>,
+    id: &ElementId,
+) -> String {
+    let covered: BTreeSet<ElementId> = expand_covered(nodes, id).into_iter().collect();
+    let node = nodes.get(id).cloned().unwrap_or_default();
+    let mut out = format!(
+        "# summary://{id} — {} elements, ~{} tokens\n",
+        covered.len(), node.covered_tokens
+    );
+    if covered.is_empty() {
+        out.push_str("(this node condenses other nodes; expand its children instead)\n");
+        return out;
+    }
+    let mut rendered = 0usize;
+    for element in snapshot.get_visible_body() {
+        if !covered.contains(&element.id) {
+            continue;
+        }
+        let mut block = render_transcript_element(snapshot, element);
+        if out.len() + block.len() > MAX_SUMMARY_BYTES {
+            out.push_str(&format!(
+                "[...expansion truncated after {rendered} of {} elements; read a line range with summary://{id}:<from>-<to>]\n",
+                covered.len()
+            ));
+            return out;
+        }
+        block.push('\n');
+        out.push_str(&block);
+        rendered += 1;
+    }
+    if rendered < covered.len() {
+        out.push_str(&format!(
+            "[{} covered elements are no longer in the transcript]\n",
+            covered.len() - rendered
+        ));
+    }
+    out
+}
+
+/// One transcript element as the model would have seen it.
+fn render_transcript_element(
+    snapshot: &SessionSnapshot,
+    element: &ElementSnapshot,
+) -> String {
+    match element.kind.as_str() {
+        "user" => format!("--- user ---\n{}\n", element.text),
+        "assistant" => format!("--- assistant ---\n{}\n", element.text),
+        "tool_call" => {
+            let tool = match element.attributes.get("tool") {
+                Some(TypedValue::String(name)) => name.clone(),
+                _ => "tool".to_string(),
+            };
+            let args = snapshot
+                .children(&element.id)
+                .find(|child| child.kind == "input")
+                .and_then(|child| child.payload.as_ref())
+                .map(|payload| payload.to_string())
+                .unwrap_or_default();
+            let result = snapshot
+                .children(&element.id)
+                .find(|child| child.kind == "result")
+                .map(|child| child.text.clone())
+                .unwrap_or_default();
+            format!("--- tool {tool} ---\narguments: {args}\n{result}\n")
+        }
+        other => format!("--- {other} ---\n{}\n", element.text),
+    }
+}
+
+/// Searches the originals behind `scope`, so the model can decide what to
+/// expand without expanding it first.
+fn render_summary_search(
+    snapshot: &SessionSnapshot,
+    nodes: &BTreeMap<ElementId, SummaryNode>,
+    scope: &[ElementId],
+    pattern: &str,
+) -> String {
+    let needle = pattern.to_lowercase();
+    let mut out = format!("# summary search for {pattern:?}\n");
+    let mut seen: BTreeSet<ElementId> = BTreeSet::new();
+    let mut matches = 0usize;
+    for id in scope {
+        for element in expand_covered(nodes, id) {
+            if !seen.insert(element.clone()) {
+                continue;
+            }
+            let Some(node) = snapshot.element(&element) else {
+                continue;
+            };
+            let rendered = render_transcript_element(snapshot, node);
+            for (index, line) in rendered.lines().enumerate() {
+                if matches >= MAX_SUMMARY_MATCHES {
+                    out.push_str(&format!(
+                        "[...more than {MAX_SUMMARY_MATCHES} matches; narrow the pattern]\n"
+                    ));
+                    return out;
+                }
+                if line.to_lowercase().contains(&needle) {
+                    matches += 1;
+                    out.push_str(&format!(
+                        "summary://{id}:{}: {}\n",
+                        index + 1,
+                        truncate_summary_line(line)
+                    ));
+                }
+            }
+        }
+    }
+    if matches == 0 {
+        out.push_str("no matches in the compacted history\n");
+    }
+    out
+}
+
+fn truncate_summary_line(line: &str) -> String {
+    let collapsed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.len() <= 200 {
+        collapsed
+    } else {
+        let mut end = 200;
+        while end > 0 && !collapsed.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &collapsed[..end])
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3000,6 +3263,114 @@ mod tests {
             bundled_shell::BUSYBOX_SHA256
         );
         assert!(path.is_file());
+    }
+
+    fn push_body_element(journal: &mut Journal, kind: &str, text: &str) -> ElementId {
+        let id = ElementId::mint();
+        let mut element = ElementSnapshot::new(id.clone(), kind);
+        element.text = text.to_string();
+        let container = journal.snapshot().container("body").clone();
+        let index = journal.snapshot().children(&container).count() as u32;
+        journal
+            .append_patch(Patch {
+                base_offset: JournalOffset(journal.snapshot().offset),
+                result_offset: journal.next_offset(),
+                by: ActorId::new("test_user").unwrap().into(),
+                reason: "test body element".into(),
+                ops: vec![PatchOp::Create {
+                    parent: container,
+                    index,
+                    element,
+                }],
+            })
+            .unwrap();
+        id
+    }
+
+    fn push_summary_node(journal: &mut Journal, covered: Vec<ElementId>, text: &str) -> ElementId {
+        let node = omp_types::SummaryNode {
+            covered,
+            children: Vec::new(),
+            covered_tokens: 128,
+            created_offset: journal.snapshot().offset,
+        };
+        let id = ElementId::new(format!("sum-{}", ElementId::mint())).unwrap();
+        let element = node.to_element(id.clone(), omp_types::SummaryKind::Leaf, text.to_string());
+        let container = journal.snapshot().container("summaries").clone();
+        let index = journal.snapshot().children(&container).count() as u32;
+        journal
+            .append_patch(Patch {
+                base_offset: JournalOffset(journal.snapshot().offset),
+                result_offset: journal.next_offset(),
+                by: ActorId::new("test_user").unwrap().into(),
+                reason: "test summary node".into(),
+                ops: vec![PatchOp::Create {
+                    parent: container,
+                    index,
+                    element,
+                }],
+            })
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn summary_read_lists_expands_and_searches_compacted_context() {
+        let temp_dir = std::env::temp_dir().join(format!("omp_test_summary_{}", ElementId::mint()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let mut journal = create_test_journal(&temp_dir);
+        let mut host = ToolHost::new(temp_dir.clone(), ActorId::new("test_user").unwrap()).unwrap();
+
+        let user = push_body_element(&mut journal, "user", "Explain the parser bug and its fix");
+        let assistant = push_body_element(&mut journal, "assistant", "The prefix guard was wrong");
+        let node = push_summary_node(
+            &mut journal,
+            vec![user.clone(), assistant.clone()],
+            "Elided transcript elements (originals retrievable by id):\n- user: Explain the parser bug\n- assistant: The prefix guard was wrong\n",
+        );
+
+        let listed = host.handle_read(&mut journal, "summary://", None, false).unwrap();
+        assert!(listed.output.content.contains(&format!("summary://{node}")));
+        assert!(listed.output.content.contains("2 elements"));
+
+        let expanded = host
+            .handle_read(&mut journal, &format!("summary://{node}"), None, false)
+            .unwrap();
+        assert!(expanded.output.content.contains("Explain the parser bug and its fix"));
+        assert!(expanded.output.content.contains("The prefix guard was wrong"));
+        assert!(expanded.output.content.contains("--- user ---"));
+
+        let selected = host
+            .handle_read(&mut journal, &format!("summary://{node}"), Some("3-4"), false)
+            .unwrap();
+        assert!(selected.output.content.contains("3:"));
+        assert!(!selected.output.content.contains("1:--- user ---"));
+
+        let searched = host
+            .handle_read(&mut journal, "summary://", Some("?q=prefix guard"), false)
+            .unwrap();
+        assert!(searched.output.content.contains("prefix guard was wrong"));
+
+        let missing = host.handle_read(&mut journal, "summary://sum-nope", None, false);
+        assert!(matches!(missing, Err(ToolError::NotFound(_))));
+
+        let no_matches = host
+            .handle_read(&mut journal, "summary://", Some("?q=absent-token"), false)
+            .unwrap();
+        assert!(no_matches.output.content.contains("no matches"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn summary_read_says_so_when_nothing_was_compacted() {
+        let temp_dir = std::env::temp_dir().join(format!("omp_test_summary_empty_{}", ElementId::mint()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let mut journal = create_test_journal(&temp_dir);
+        let mut host = ToolHost::new(temp_dir.clone(), ActorId::new("test_user").unwrap()).unwrap();
+        let response = host.handle_read(&mut journal, "summary://", None, false).unwrap();
+        assert!(response.output.content.contains("Nothing has been compacted"));
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

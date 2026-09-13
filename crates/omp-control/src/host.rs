@@ -1,4 +1,4 @@
-use omp_inference::compaction::SpeculativeCompactionGuard;
+use omp_inference::compaction::{CompactionBudget, SpeculativeCompactionGuard, estimate_tokens};
 use omp_inference::request::{
     InferenceRequest, SamplingParams, SemanticMessage, ThinkingMode,
     ToolCallSpec, ToolChoiceRequirement, ToolSchema,
@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 
 use crate::agent_loop::DirectorStack;
 use crate::command::{CommandEffect, CommandEngine};
+use crate::compaction::{
+    CompactionConfig, CompactionOutcome, DEFAULT_KEEP_RECENT_TURNS, DEFAULT_MAX_ROOT_NODES,
+};
 use crate::convar::{ConVarStore, register_builtin_convars};
 use crate::director::{
     AgentView, DirectorSpec, ForceTool, ForceToolFailureBehavior, ToolCallInfo, TurnView,
@@ -189,7 +192,8 @@ impl SessionHost {
             step += 1;
 
             // Derive base InferenceRequest from the selected branch
-            let mut request = self.derive_inference_request(journal.snapshot())?;
+            let compaction = self.plan_compaction(journal)?;
+            let mut request = self.derive_inference_request(journal.snapshot(), &compaction)?;
 
             // Walk Directors outer-to-inner to prepare request
             request = self.director_stack.prepare_inference(request)?;
@@ -766,16 +770,80 @@ impl SessionHost {
         Ok(child)
     }
 
+    /// Budget the compaction planner works against, or `None` when this
+    /// session's provider never advertised a context window.
+    fn compaction_config(&self, overhead_tokens: usize) -> Option<CompactionConfig> {
+        let window = self
+            .convars
+            .get_typed::<i64>("ai_context_length")
+            .ok()
+            .filter(|value| *value > 0)? as usize;
+        let ratio = self
+            .convars
+            .get_typed::<f64>("ai_compaction_threshold")
+            .unwrap_or(0.8);
+        let completion = self
+            .convars
+            .get_typed::<i64>("ai_max_tokens")
+            .ok()
+            .filter(|value| *value > 0)
+            .unwrap_or(COMPLETION_RESERVE_TOKENS as i64) as usize;
+        // The completion and a small safety margin share the window with the
+        // prompt; the tool roster is already part of `overhead_tokens`.
+        let reserve = completion.saturating_add(COMPLETION_SAFETY_MARGIN_TOKENS);
+        let budget = CompactionBudget::derive(window, ratio, reserve)?;
+        Some(CompactionConfig {
+            budget,
+            keep_recent_turns: DEFAULT_KEEP_RECENT_TURNS,
+            max_root_nodes: DEFAULT_MAX_ROOT_NODES,
+            fixed_overhead_tokens: overhead_tokens,
+        })
+    }
+
+    /// Tokens the tool roster costs in every request.
+    fn tool_schema_tokens(&self) -> usize {
+        self.tool_host
+            .registry
+            .permanent_tools()
+            .map(|tool| {
+                estimate_tokens(&tool.name)
+                    + estimate_tokens(&tool.component_projection)
+                    + estimate_tokens(&tool.parameters.to_string())
+                    + 8
+            })
+            .sum()
+    }
+
+    /// Plans this turn's context projection, journaling any compaction nodes.
+    fn plan_compaction(
+        &self,
+        journal: &mut Journal,
+    ) -> Result<CompactionOutcome, StructuredError> {
+        let Some(config) = self.compaction_config(self.tool_schema_tokens()) else {
+            return Ok(CompactionOutcome::default());
+        };
+        crate::compaction::plan(journal, &self.owner, &config)
+    }
+
     fn derive_inference_request(
         &self,
         snapshot: &SessionSnapshot,
+        compaction: &CompactionOutcome,
     ) -> Result<InferenceRequest, StructuredError> {
         let mut messages = Vec::new();
 
         for elem in snapshot.get_visible_body() {
+            // Elided elements are represented by the summary folds instead; the
+            // originals stay addressable through `Read summary://<id>`.
+            if compaction.covered.contains(&elem.id) {
+                continue;
+            }
             match elem.kind.as_str() {
                 "user" => {
-                    messages.push(SemanticMessage::user(&elem.text));
+                    messages.push(SemanticMessage::user(compaction.project_text(
+                        &elem.id,
+                        &elem.text,
+                    )));
                 }
                 "assistant" => {
                     // Interrupted output remains inspectable, but is not a completed model turn.
@@ -785,7 +853,10 @@ impl SessionHost {
                     {
                         continue;
                     }
-                    let mut msg = SemanticMessage::assistant(&elem.text);
+                    let mut msg = SemanticMessage::assistant(compaction.project_text(
+                        &elem.id,
+                        &elem.text,
+                    ));
                     if let Some(TypedValue::String(call_id_str)) =
                         elem.attributes.get("tool_call_id")
                         && let Ok(cid) = ToolCallId::new(call_id_str) {
@@ -805,11 +876,19 @@ impl SessionHost {
                                 })
                                 .unwrap_or_else(|| "unknown".into());
 
-                            let args = snapshot
+                            let mut args = snapshot
                                 .children(&elem.id)
                                 .find(|child| child.kind == "input")
                                 .and_then(|child| child.payload.clone())
                                 .unwrap_or_default();
+                            // Oversized payloads the model already acted on are
+                            // replaced by a marker, never sent verbatim: the
+                            // journal keeps the originals.
+                            if compaction.omits_arguments(&elem.id) {
+                                args = serde_json::json!({
+                                    "omitted": "arguments elided to fit the context window; the journal keeps them"
+                                });
+                            }
                             let mut msg = SemanticMessage::assistant("");
                             msg.tool_calls.push(ToolCallSpec {
                                 id: cid,
@@ -829,7 +908,7 @@ impl SessionHost {
                                             false,
                                         )
                                     })?,
-                                    &result.text,
+                                    compaction.project_text(&elem.id, &result.text),
                                 ));
                             }
                         }
@@ -890,7 +969,7 @@ impl SessionHost {
 
         Ok(InferenceRequest {
             messages,
-            folds: Vec::new(),
+            folds: compaction.folds.clone(),
             active_tools,
             desired_thinking,
             tool_choice: ToolChoiceRequirement::Auto,
@@ -1207,6 +1286,11 @@ impl SessionHost {
 /// (an fsync per append), so text and thinking accumulate instead.
 const STREAM_FLUSH_INTERVAL_MS: u64 = 100;
 const STREAM_FLUSH_BYTES: usize = 64 * 1024;
+/// Completion budget assumed when `ai_max_tokens` advertises none.
+const COMPLETION_RESERVE_TOKENS: usize = 4_096;
+/// Slack kept between the projected prompt and the advertised window, covering
+/// the error of the deterministic token estimate.
+const COMPLETION_SAFETY_MARGIN_TOKENS: usize = 1_024;
 
 /// Appends buffered stream deltas as a single journal patch: text onto the
 /// assistant element, thinking onto the existing `think` child (created on

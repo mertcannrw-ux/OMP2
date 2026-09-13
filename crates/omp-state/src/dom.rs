@@ -78,6 +78,7 @@ const ROOTS: &[&str] = &[
     "prompts",
     "approvals",
     "scheduler",
+    "summaries",
 ];
 
 impl SessionSnapshot {

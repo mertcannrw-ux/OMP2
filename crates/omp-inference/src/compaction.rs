@@ -2,6 +2,89 @@ use crate::request::MessageFold;
 use omp_types::{BranchId, JournalOffset, StructuredError};
 use serde::{Deserialize, Serialize};
 
+/// Deterministic token estimate for one text body.
+///
+/// OMP2 has no tokenizer for arbitrary provider dialects, so the compaction
+/// planner needs an estimate that is (a) identical on every replica replaying
+/// the same journal and (b) never optimistic — an under-estimate is what turns
+/// a "fits the window" decision into a provider error.
+///
+/// ASCII is charged four bytes per token, which matches English/code BPE
+/// vocabularies within roughly ±20%. Every non-ASCII character is charged two
+/// tokens regardless of script: production BPE rates are around 1–1.5 tokens
+/// per CJK character and below 1 per accented Latin character, so two is an
+/// upper bound rather than a measurement. The `CompactionBudget` reserve then
+/// only has to cover the ASCII term.
+pub fn estimate_tokens(text: &str) -> usize {
+    let mut ascii_bytes = 0usize;
+    let mut wide_chars = 0usize;
+    for character in text.chars() {
+        if character.is_ascii() {
+            ascii_bytes += 1;
+        } else {
+            wide_chars += 1;
+        }
+    }
+    ascii_bytes.div_ceil(4) + wide_chars * 2
+}
+
+/// Soft/hard limits for the provider projection of one session.
+///
+/// `soft_tokens` is where elision starts; `hard_tokens` is what the projection
+/// must be under once it is done. Both are derived from the advertised context
+/// window so a provider that never advertises one simply never compacts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactionBudget {
+    pub soft_tokens: usize,
+    pub hard_tokens: usize,
+}
+
+impl CompactionBudget {
+    /// Derives the budget from the advertised window, the session's
+    /// `ai_compaction_threshold` ratio, and the tokens reserved for tool
+    /// schemas, pinned instructions and the completion.
+    ///
+    /// Returns `None` when the inputs cannot support a meaningful budget: an
+    /// unknown/zero window, or a reserve that leaves less than a quarter of the
+    /// window for history.
+    pub fn derive(window_tokens: usize, threshold_ratio: f64, reserve_tokens: usize) -> Option<Self> {
+        if window_tokens == 0 || window_tokens <= reserve_tokens {
+            return None;
+        }
+        if window_tokens.saturating_sub(reserve_tokens) < window_tokens / 4 {
+            return None;
+        }
+        let ratio = if threshold_ratio.is_finite() {
+            threshold_ratio.clamp(0.1, 1.0)
+        } else {
+            0.8
+        };
+        let hard_tokens = window_tokens - reserve_tokens;
+        // A ratio that lands above the hard bound is clamped down to it: the
+        // trigger may never sit above the limit it is supposed to protect.
+        let soft_tokens = ((window_tokens as f64) * ratio).floor().max(1.0) as usize;
+        Some(Self {
+            soft_tokens: soft_tokens.min(hard_tokens).max(1),
+            hard_tokens,
+        })
+    }
+
+    /// Tokens the projection should be reduced to when elision runs: half the
+    /// soft bound, so a single pass buys headroom instead of eliding again on
+    /// the next turn.
+    pub fn target_tokens(&self) -> usize {
+        (self.soft_tokens / 2).max(1)
+    }
+
+    pub fn should_trigger(&self, projected_tokens: usize) -> bool {
+        CompactionTrigger::should_trigger(projected_tokens, self.soft_tokens)
+    }
+
+    pub fn exceeds_hard_bound(&self, projected_tokens: usize) -> bool {
+        projected_tokens > self.hard_tokens
+    }
+}
+
 /// Snapshot of the session state at the moment speculative compaction begins.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionSnapshot {
@@ -200,5 +283,69 @@ impl CompactionIntegration {
     ) -> Option<MessageFold> {
         self.guard
             .discard_if_stale(snapshot, current_branch, current_offset, candidate)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn estimate_tokens_is_deterministic_and_monotone() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
+        assert!(estimate_tokens("a longer body of text") > estimate_tokens("short"));
+    }
+
+    #[test]
+    fn estimate_tokens_never_under_charges_non_ascii_text() {
+        // Three-byte CJK characters: 100 of them are ~100-150 real tokens on
+        // production vocabularies, so the estimate must not come in below one
+        // token per character.
+        let cjk = "漢字かな交じり文".repeat(12);
+        assert!(estimate_tokens(&cjk) >= cjk.chars().count());
+        // Two-byte accented Latin is charged at least as much as its character
+        // count, which is above the real rate but never below it.
+        let accents = "é".repeat(200);
+        assert!(estimate_tokens(&accents) >= 400);
+        // Mixed text still tracks the ASCII rule.
+        assert_eq!(estimate_tokens("abcd漢"), 3);
+    }
+
+    #[test]
+    fn budget_keeps_the_trigger_below_the_limit_it_protects() {
+        // 64k window, default ratio, 18k reserved for tools and completion.
+        let budget = CompactionBudget::derive(64_000, 0.8, 18_000).unwrap();
+        assert_eq!(budget.hard_tokens, 46_000);
+        assert!(budget.soft_tokens <= budget.hard_tokens);
+        assert_eq!(budget.soft_tokens, 46_000, "ratio above the hard bound clamps down");
+        assert_eq!(budget.target_tokens(), 23_000);
+
+        // A window with room to spare keeps the ratio.
+        let budget = CompactionBudget::derive(200_000, 0.8, 20_000).unwrap();
+        assert_eq!(budget.soft_tokens, 160_000);
+        assert_eq!(budget.hard_tokens, 180_000);
+        assert!(budget.should_trigger(160_000));
+        assert!(!budget.should_trigger(159_999));
+        assert!(budget.exceeds_hard_bound(180_001));
+    }
+
+    #[test]
+    fn budget_refuses_inputs_it_cannot_honour() {
+        assert!(CompactionBudget::derive(0, 0.8, 0).is_none());
+        // Reserve eats the window.
+        assert!(CompactionBudget::derive(8_000, 0.8, 8_000).is_none());
+        // Reserve leaves less than a quarter of the window for history.
+        assert!(CompactionBudget::derive(8_000, 0.8, 6_500).is_none());
+    }
+
+    #[test]
+    fn budget_clamps_hostile_ratios() {
+        for ratio in [f64::NAN, f64::INFINITY, -3.0, 0.0, 99.0] {
+            let budget = CompactionBudget::derive(100_000, ratio, 10_000).unwrap();
+            assert!(budget.soft_tokens >= 1);
+            assert!(budget.soft_tokens <= budget.hard_tokens);
+        }
     }
 }

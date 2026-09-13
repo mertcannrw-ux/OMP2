@@ -240,6 +240,9 @@ pub enum ResourceScheme {
     Sqlite,
     Archive,
     Document,
+    /// `summary://` — the compaction DAG: list nodes, expand the elements they
+    /// elide, or search them.
+    Summary,
     Custom(String),
 }
 
@@ -265,6 +268,8 @@ impl ResourceScheme {
             (ResourceScheme::Http, rest)
         } else if let Some(rest) = uri.strip_prefix("https://") {
             (ResourceScheme::Https, rest)
+        } else if let Some(rest) = uri.strip_prefix("summary://") {
+            (ResourceScheme::Summary, rest)
         } else if let Some(rest) = uri.strip_prefix("file://") {
             (ResourceScheme::File, rest)
         } else {

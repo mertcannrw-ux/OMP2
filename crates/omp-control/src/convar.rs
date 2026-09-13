@@ -902,7 +902,7 @@ pub fn register_builtin_convars(store: &mut ConVarStore) {
         ConVar::new(
             "ai_compaction_threshold",
             0.8_f64,
-            "Context window threshold for speculative compaction",
+            "Fraction of the advertised context window at which older turns are elided",
             session_replicated,
         )
         .with_validator(|v| match v {
