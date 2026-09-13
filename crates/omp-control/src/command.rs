@@ -18,6 +18,77 @@ pub enum ProviderAction {
     Select {
         model: String,
     },
+    /// List every configured provider and mark the active one.
+    List,
+    /// Register a provider without switching to it.
+    Add {
+        name: String,
+        endpoint: String,
+        adapter: String,
+        key_env: String,
+        model: Option<String>,
+    },
+    /// Make a registered provider the active one.
+    Use {
+        name: String,
+    },
+    /// Forget a registered provider.
+    Remove {
+        name: String,
+    },
+}
+
+/// Dialect assumed for an endpoint nobody described.
+fn endpoint_default_adapter(endpoint: &str) -> String {
+    if endpoint.starts_with("https://api.anthropic.com/") {
+        "anthropic".to_string()
+    } else {
+        "openai_compatible".to_string()
+    }
+}
+
+/// Parses `--adapter/--key-env/--model` pairs shared by `add` and bare endpoint
+/// configuration. Credentials are never accepted, only the variable name.
+fn parse_provider_options(
+    default_adapter: String,
+    options: &[String],
+) -> Result<(String, String, Option<String>), CommandError> {
+    let mut adapter = default_adapter;
+    let mut key_env = "OMP_API_KEY".to_string();
+    let mut model = None;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut pairs = options.chunks_exact(2);
+    for pair in &mut pairs {
+        if !seen.insert(pair[0].as_str()) {
+            return Err(CommandError::Parse("duplicate provider option".into()));
+        }
+        match pair[0].as_str() {
+            "--adapter" => adapter = pair[1].clone(),
+            "--key-env" => key_env = pair[1].clone(),
+            "--model" => model = Some(pair[1].clone()),
+            _ => {
+                return Err(CommandError::Parse(
+                    "unknown provider option; use /provider --help".into(),
+                ));
+            }
+        }
+    }
+    if !pairs.remainder().is_empty() {
+        return Err(CommandError::Parse("provider option needs a value".into()));
+    }
+    Ok((adapter, key_env, model))
+}
+
+impl ProviderAction {
+    /// True when the action only edits the provider registry.
+    ///
+    /// Registry edits are configuration: they must be allowed inside a `exec`
+    /// stream (a profile or user config declaring providers) and must not force
+    /// the "run this alone" rule that exists for actions performing network
+    /// work.
+    pub fn is_pure_configuration(&self) -> bool {
+        matches!(self, Self::Add { .. } | Self::Remove { .. } | Self::List)
+    }
 }
 
 /// Representation of a parsed command.
@@ -490,23 +561,26 @@ impl CommandParser {
                     None => ProviderAction::Show,
                     Some("refresh") if tokens.len() == 2 => ProviderAction::Refresh,
                     Some("select") if tokens.len() == 3 => ProviderAction::Select { model: tokens[2].clone() },
-                    Some("--help" | "help") => return Ok(Command::Echo { message: "Usage: /provider [<endpoint> [--adapter <dialect>] [--key-env <ENV>] [--model <id>] | refresh | select <id>]. Models and advertised limits are fetched at startup. Default dialect: OpenAI-compatible; key: OMP_API_KEY. Never paste API keys into commands.".into() }),
-                    Some(endpoint) => {
-                        let mut adapter = if endpoint.starts_with("https://api.anthropic.com/") { "anthropic" } else { "openai_compatible" }.to_string();
-                        let mut key_env = "OMP_API_KEY".to_string();
-                        let mut model = None;
-                        let mut seen = std::collections::BTreeSet::new();
-                        let mut options = tokens[2..].chunks_exact(2);
-                        for pair in &mut options {
-                            if !seen.insert(pair[0].as_str()) { return Err(CommandError::Parse("duplicate provider option".into())); }
-                            match pair[0].as_str() {
-                                "--adapter" => adapter = pair[1].clone(),
-                                "--key-env" => key_env = pair[1].clone(),
-                                "--model" => model = Some(pair[1].clone()),
-                                _ => return Err(CommandError::Parse("unknown provider option; use /provider --help".into())),
-                            }
+                    Some("list") if tokens.len() == 2 => ProviderAction::List,
+                    Some("use") if tokens.len() == 3 => ProviderAction::Use { name: tokens[2].clone() },
+                    Some("remove") if tokens.len() == 3 => ProviderAction::Remove { name: tokens[2].clone() },
+                    Some("add") if tokens.len() >= 4 => {
+                        let (adapter, key_env, model) = parse_provider_options(
+                            endpoint_default_adapter(&tokens[3]),
+                            &tokens[4..],
+                        )?;
+                        ProviderAction::Add {
+                            name: tokens[2].clone(),
+                            endpoint: tokens[3].clone(),
+                            adapter,
+                            key_env,
+                            model,
                         }
-                        if !options.remainder().is_empty() { return Err(CommandError::Parse("provider option needs a value".into())); }
+                    }
+                    Some("--help" | "help") => return Ok(Command::Echo { message: "Usage: /provider [list | add <name> <endpoint> [--adapter <dialect>] [--key-env <ENV>] [--model <id>] | use <name> | remove <name> | refresh | select <id> | <endpoint> [options]]. Providers are recorded in the session, so switching costs no retyping; the model list names the provider each model came from. Default dialect: OpenAI-compatible; key: OMP_API_KEY. Never paste API keys into commands.".into() }),
+                    Some(endpoint) => {
+                        let (adapter, key_env, model) =
+                            parse_provider_options(endpoint_default_adapter(endpoint), &tokens[2..])?;
                         ProviderAction::Configure { endpoint: endpoint.into(), adapter, key_env, model }
                     }
                 };

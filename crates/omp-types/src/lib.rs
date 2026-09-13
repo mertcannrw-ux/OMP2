@@ -1,10 +1,12 @@
 pub mod ids;
 pub mod patch;
+pub mod provider;
 pub mod status;
 pub mod summary;
 pub mod version;
 pub use ids::*;
 pub use patch::*;
+pub use provider::*;
 pub use status::*;
 pub use summary::*;
 pub use version::*;

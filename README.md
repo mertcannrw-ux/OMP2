@@ -405,6 +405,39 @@ the convar is the answer when a model reasons for longer than that between token
 the first token a stall is never retried, because a replay would duplicate text.
 Connecting has its own short timeout, so an unreachable endpoint fails in seconds.
 
+### Multiple providers
+
+A session records the providers it can reach, so switching costs no retyping and the model
+list says where each model came from:
+
+```
+/provider list                                     what is recorded, and which one is active
+/provider add clawbay https://api.theclawbay.com/v1 --key-env OPENAI_API_KEY
+/provider use clawbay                              make it active and fetch its catalog
+/provider remove clawbay                           forget it
+/provider                                          the active provider's catalog
+```
+
+Records live in the journal (`<providers>`), so they fork, rewind and replicate with the
+session. A record stores the *name* of the credential variable, never the credential:
+`/provider add` validates that name and refuses anything that looks like a key. Adding a
+provider whose key is missing still records it and reports why the catalog could not be
+fetched, so the entry survives until the environment is fixed.
+
+The active provider is still the one named by `ai_provider`/`ai_endpoint`/`ai_model`, which
+is what request derivation, compaction budgets and replication read. Everything else is
+bookkeeping on top, and `/provider refresh` refreshes every recorded provider's catalog,
+not just the active one.
+
+In the model list, entries carry their provider:
+
+```
+/provider select glm-5.3-flash                     opencode-go · 1000k ctx · active provider
+/provider use clawbay; /provider select claude-fable-5    clawbay · 200k ctx · switches provider
+```
+
+Selecting a model that belongs to another provider switches to it first, in one step.
+
 | Environment variable | Purpose |
 | --- | --- |
 | `OMP_ENDPOINT` (or `AI_ENDPOINT`, `OPENAI_BASE_URL`) | Provider endpoint. |

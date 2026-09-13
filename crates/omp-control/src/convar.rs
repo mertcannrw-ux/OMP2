@@ -997,6 +997,13 @@ pub fn register_builtin_convars(store: &mut ConVarStore) {
         }),
     );
 
+    store.register(ConVar::new(
+        "ai_provider_name",
+        String::new(),
+        "Name of the active provider in the session's provider registry",
+        session_replicated,
+    ));
+
     store.register(
         ConVar::new(
             "ai_request_timeout_secs",

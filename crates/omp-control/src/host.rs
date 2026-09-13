@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::agent_loop::DirectorStack;
-use crate::command::{CommandEffect, CommandEngine};
+use crate::command::{CommandEffect, CommandEngine, ProviderAction};
 use crate::compaction::{
     CompactionConfig, CompactionOutcome, DEFAULT_KEEP_RECENT_TURNS, DEFAULT_MAX_ROOT_NODES,
 };
@@ -543,7 +543,9 @@ impl SessionHost {
                     CommandEffect::ToolExecuted { .. }
                         | CommandEffect::DynDiscovered { .. }
                         | CommandEffect::JobCancelled { .. }
-                        | CommandEffect::Provider { .. }
+                ) || matches!(
+                    effect,
+                    CommandEffect::Provider { action } if !action.is_pure_configuration()
                 )
             })
             .count();
@@ -554,8 +556,24 @@ impl SessionHost {
                 false,
             ));
         }
-        if let Some(CommandEffect::Provider { action }) = effects.first() {
-            return self.execute_provider_command(journal, action.clone());
+        // Provider actions that only edit the registry run here, so a profile or
+        // user config can declare providers next to ordinary settings; the ones
+        // that reach the network (discovery, selection, switching) run alone.
+        let provider_actions: Vec<ProviderAction> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                CommandEffect::Provider { action } => Some(action.clone()),
+                _ => None,
+            })
+            .collect();
+        if let Some(remote) = provider_actions
+            .iter()
+            .find(|action| !action.is_pure_configuration())
+        {
+            return self.execute_provider_command(journal, remote.clone());
+        }
+        for action in &provider_actions {
+            self.execute_provider_command(journal, action.clone())?;
         }
         let provider_changed = effects.iter().any(|effect| matches!(effect,
             CommandEffect::ConVarUpdated { name, .. } if matches!(name.as_str(), "ai_provider" | "ai_endpoint" | "ai_api_key_env" | "ai_model")));

@@ -2,7 +2,8 @@ use crate::{ConVarStore, ProviderAction, SessionHost};
 use omp_inference::{ProviderClient, ProviderMetadata};
 use omp_state::Journal;
 use omp_types::{
-    ElementId, ElementSnapshot, JournalOffset, Patch, PatchOp, StructuredError, TypedValue,
+    ElementId, ElementSnapshot, JournalOffset, Patch, PatchOp, PROVIDERS_CONTAINER,
+    PROVIDER_MODELS_ATTRIBUTE, ProviderRecord, StructuredError, TypedValue,
 };
 
 fn setting(store: &ConVarStore, name: &str, envs: &[&str]) -> String {
@@ -56,6 +57,258 @@ fn summarize_provider_metadata(meta: &serde_json::Value) -> String {
 }
 
 impl SessionHost {
+    /// Journals one diagnostic element, which is how the console reports state.
+    fn emit_provider_diagnostic(
+        &mut self,
+        journal: &mut Journal,
+        text: String,
+    ) -> Result<(), StructuredError> {
+        let mut node = ElementSnapshot::new(ElementId::mint(), "diagnostic");
+        node.text = text;
+        journal
+            .append_patch(Patch {
+                base_offset: JournalOffset(journal.snapshot().offset),
+                result_offset: journal.next_offset(),
+                by: self.owner.clone().into(),
+                reason: "provider diagnostic".into(),
+                ops: vec![PatchOp::Create {
+                    parent: journal.snapshot().container("body").clone(),
+                    index: journal.snapshot().get_visible_body().count() as u32,
+                    element: node,
+                }],
+            })
+            .map_err(|error| error.structured())
+            .map(|_| ())
+    }
+
+    /// Every provider the session has been told about, in insertion order.
+    pub fn providers(&self, snapshot: &omp_state::SessionSnapshot) -> Vec<ProviderRecord> {
+        snapshot
+            .children(snapshot.container(PROVIDERS_CONTAINER))
+            .filter_map(ProviderRecord::from_element)
+            .collect()
+    }
+
+    /// Models cached for one registered provider, as last fetched.
+    pub fn provider_models(
+        &self,
+        snapshot: &omp_state::SessionSnapshot,
+        record: &ProviderRecord,
+    ) -> Vec<serde_json::Value> {
+        snapshot
+            .children(snapshot.container(PROVIDERS_CONTAINER))
+            .find(|element| {
+                ProviderRecord::from_element(element)
+                    .is_some_and(|existing| existing.name == record.name)
+            })
+            .and_then(|element| element.attributes.get(PROVIDER_MODELS_ATTRIBUTE))
+            .and_then(|value| match value {
+                TypedValue::Json(models) => models.as_array().cloned(),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Registers a provider, replacing any record with the same name.
+    pub fn record_provider(
+        &mut self,
+        journal: &mut Journal,
+        record: &ProviderRecord,
+        models: Option<serde_json::Value>,
+    ) -> Result<(), StructuredError> {
+        let container = journal.snapshot().container(PROVIDERS_CONTAINER).clone();
+        let existing = journal
+            .snapshot()
+            .children(&container)
+            .find(|element| {
+                ProviderRecord::from_element(element)
+                    .is_some_and(|current| current.name == record.name)
+            })
+            .map(|element| element.id.clone());
+        let mut ops = match existing.clone() {
+            Some(id) => ["name", "adapter", "endpoint", "key_env", "model"]
+                .into_iter()
+                .map(|attribute| {
+                    let value = match attribute {
+                        "name" => record.name.clone(),
+                        "adapter" => record.adapter.clone(),
+                        "endpoint" => record.endpoint.clone(),
+                        "key_env" => record.key_env.clone(),
+                        _ => record.model.clone(),
+                    };
+                    PatchOp::SetAttribute {
+                        element: id.clone(),
+                        name: attribute.into(),
+                        value: TypedValue::String(value),
+                    }
+                })
+                .collect::<Vec<_>>(),
+            None => {
+                let id = ElementId::new(format!("provider-{}", record.name)).map_err(|_| {
+                    StructuredError::new(
+                        "invalid_provider_name",
+                        "Provider names use letters, digits, dots, underscores or hyphens",
+                        false,
+                    )
+                })?;
+                vec![PatchOp::Create {
+                    parent: container.clone(),
+                    index: journal.snapshot().children(&container).count() as u32,
+                    element: record.to_element(id),
+                }]
+            }
+        };
+        // Two records for one endpoint would both look active; the name just
+        // declared wins, and the record it replaces is forgotten.
+        let replaced: Vec<ElementId> = journal
+            .snapshot()
+            .children(&container)
+            .filter(|element| {
+                ProviderRecord::from_element(element).is_some_and(|existing| {
+                    existing.name != record.name && existing.matches_endpoint(&record.adapter, &record.endpoint)
+                })
+            })
+            .map(|element| element.id.clone())
+            .collect();
+        ops.extend(replaced.into_iter().map(|element| PatchOp::Delete { element }));
+        if let Some(models) = models {
+            let id = existing.unwrap_or_else(|| {
+                ElementId::new(format!("provider-{}", record.name)).expect("validated name")
+            });
+            ops.push(PatchOp::SetAttribute {
+                element: id,
+                name: PROVIDER_MODELS_ATTRIBUTE.into(),
+                value: TypedValue::Json(models),
+            });
+        }
+        journal
+            .append_patch(Patch {
+                base_offset: JournalOffset(journal.snapshot().offset),
+                result_offset: journal.next_offset(),
+                by: self.owner.clone().into(),
+                reason: format!("register provider {}", record.name),
+                ops,
+            })
+            .map_err(|error| error.structured())
+            .map(|_| ())
+    }
+
+    /// Forgets a registered provider.
+    pub fn forget_provider(
+        &mut self,
+        journal: &mut Journal,
+        name: &str,
+    ) -> Result<bool, StructuredError> {
+        let container = journal.snapshot().container(PROVIDERS_CONTAINER).clone();
+        let Some(id) = journal
+            .snapshot()
+            .children(&container)
+            .find(|element| {
+                ProviderRecord::from_element(element).is_some_and(|record| record.name == name)
+            })
+            .map(|element| element.id.clone())
+        else {
+            return Ok(false);
+        };
+        journal
+            .append_patch(Patch {
+                base_offset: JournalOffset(journal.snapshot().offset),
+                result_offset: journal.next_offset(),
+                by: self.owner.clone().into(),
+                reason: format!("forget provider {name}"),
+                ops: vec![PatchOp::Delete { element: id }],
+            })
+            .map_err(|error| error.structured())?;
+        Ok(true)
+    }
+
+    /// Client for one registered provider, without making it active.
+    fn client_for_record(&self, record: &ProviderRecord) -> Result<ProviderClient, StructuredError> {
+        let adapter = if record.adapter.is_empty() {
+            "openai_compatible".to_string()
+        } else {
+            record.adapter.clone()
+        };
+        let mut client = ProviderClient::new(
+            adapter,
+            record.model.clone(),
+            (!record.endpoint.is_empty()).then(|| record.endpoint.clone()),
+        )?;
+        if !record.key_env.is_empty() {
+            let key = std::env::var(&record.key_env)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    StructuredError::new(
+                        "missing_credentials",
+                        format!(
+                            "Environment variable {} is empty or absent; set it before using provider '{}'",
+                            record.key_env, record.name
+                        ),
+                        false,
+                    )
+                })?;
+            client = client.with_api_key(key);
+        }
+        Ok(client)
+    }
+
+    /// Fetches one provider's catalog and caches it on its record.
+    fn refresh_registered_provider(
+        &mut self,
+        journal: &mut Journal,
+        record: &ProviderRecord,
+    ) -> Result<usize, StructuredError> {
+        let mut client = self.client_for_record(record)?;
+        let metadata = client.refresh_metadata()?;
+        let models = serde_json::to_value(&metadata.models).map_err(|error| {
+            StructuredError::new("provider_registry", error.to_string(), false)
+        })?;
+        let count = metadata.models.len();
+        self.record_provider(journal, record, Some(models))?;
+        Ok(count)
+    }
+
+    /// Human-readable provider inventory: what is configured, what is active,
+    /// and how many models each one has.
+    pub fn provider_report(&self, snapshot: &omp_state::SessionSnapshot) -> String {
+        let records = self.providers(snapshot);
+        let adapter = self.convars.get_typed::<String>("ai_provider").unwrap_or_default();
+        let endpoint = self.convars.get_typed::<String>("ai_endpoint").unwrap_or_default();
+        let active = omp_types::label_for_endpoint(&records, &adapter, &endpoint);
+        let mut out = if records.is_empty() {
+            format!(
+                "No providers recorded yet; active endpoint: {} ({}). Add one: /provider add <name> <endpoint> [--key-env ENV]",
+                if endpoint.is_empty() { "(none)" } else { &endpoint },
+                active
+            )
+        } else {
+            format!(
+                "{} provider(s) recorded; active: {active} ({})",
+                records.len(),
+                if endpoint.is_empty() { "no endpoint" } else { &endpoint }
+            )
+        };
+        for record in &records {
+            let models = self.provider_models(snapshot, record).len();
+            let registered = record.matches_endpoint(&adapter, &endpoint);
+            out.push_str(&format!(
+                "\n  {} {} · {} · {}{}{}{}",
+                if registered { '*' } else { '-' },
+                record.name,
+                if record.adapter.is_empty() { "openai_compatible" } else { &record.adapter },
+                record.endpoint,
+                if models == 0 { String::new() } else { format!(" · {models} models") },
+                if record.model.is_empty() { String::new() } else { format!(" · model {}", record.model) },
+                if record.key_env.is_empty() { String::new() } else { format!(" · key ${}", record.key_env) },
+            ));
+        }
+        out.push_str(
+            "\nSwitch: /provider use <name>. Add: /provider add <name> <endpoint> [--key-env ENV]. Forget: /provider remove <name>. Catalogs: /provider refresh.",
+        );
+        out
+    }
+
     pub(crate) fn provider_from_config(
         &self,
         store: &ConVarStore,
@@ -182,6 +435,52 @@ impl SessionHost {
     }
     /// Refresh the provider catalog once at each run/resume/serve startup.
     /// Failure clears advertised limits rather than silently reusing stale metadata.
+    /// Fetches catalogs for registered providers. `only_empty` keeps startup
+    /// cheap: a provider whose catalog is already cached waits for an explicit
+    /// refresh.
+    pub(crate) fn refresh_registered_catalogs(
+        &mut self,
+        journal: &mut Journal,
+        only_empty: bool,
+    ) -> Result<(), StructuredError> {
+        let records = self.providers(journal.snapshot());
+        let active_endpoint = self
+            .convars
+            .get_typed::<String>("ai_endpoint")
+            .unwrap_or_default();
+        let mut failures = Vec::new();
+        let mut refreshed = 0usize;
+        for record in records {
+            if omp_types::normalize_endpoint(&record.endpoint)
+                == omp_types::normalize_endpoint(&active_endpoint)
+            {
+                continue;
+            }
+            if only_empty && !self.provider_models(journal.snapshot(), &record).is_empty() {
+                continue;
+            }
+            match self.refresh_registered_provider(journal, &record) {
+                Ok(_) => refreshed += 1,
+                Err(error) => failures.push(format!("{}: {}", record.name, error.message)),
+            }
+        }
+        if !failures.is_empty() {
+            self.emit_provider_diagnostic(
+                journal,
+                format!(
+                    "Some provider catalogs could not be fetched: {}",
+                    failures.join("; ")
+                ),
+            )?;
+        } else if refreshed > 0 {
+            self.emit_provider_diagnostic(
+                journal,
+                format!("Fetched {refreshed} registered provider catalog(s)."),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn initialize_provider(&mut self, journal: &mut Journal) -> Result<(), StructuredError> {
         self.convars.hydrate_from_dom(journal.snapshot());
         let mut client = match self.provider_from_config(&self.convars) {
@@ -211,19 +510,26 @@ impl SessionHost {
         };
         if client.provider.is_empty() {
             self.provider = client;
+            // No active provider is configured, but declared providers still
+            // deserve their catalogs.
+            self.refresh_registered_catalogs(journal, true)?;
             return Ok(());
         }
         let key_env = self
             .convars
             .get_typed::<String>("ai_api_key_env")
             .unwrap_or_default();
-        match Self::fetch_selection(&mut client, false) {
+        let outcome = match Self::fetch_selection(&mut client, false) {
             Ok(meta) => self.commit_provider(journal, client, &key_env, Some(meta), None),
             Err(error) => {
                 self.commit_provider(journal, client, &key_env, None, Some(&error))?;
                 Err(error)
             }
-        }
+        };
+        // Providers a profile or config file declared have no catalog yet; fetch
+        // those now so the model list is complete from the first prompt.
+        let _ = self.refresh_registered_catalogs(journal, true);
+        outcome
     }
 
     fn fetch_selection(
@@ -277,24 +583,112 @@ impl SessionHost {
                     }
                     _ => "No provider catalog. Set OMP_API_KEY in the host environment, then /provider <endpoint>. Models and advertised settings refresh on every startup. Never paste API keys into commands.".into(),
                 };
-                let mut node = ElementSnapshot::new(ElementId::mint(), "diagnostic");
-                node.text = text;
-                journal
-                    .append_patch(Patch {
-                        base_offset: JournalOffset(journal.snapshot().offset),
-                        result_offset: journal.next_offset(),
-                        by: self.owner.clone().into(),
-                        reason: "show provider configuration".into(),
-                        ops: vec![PatchOp::Create {
-                            parent: journal.snapshot().container("body").clone(),
-                            index: journal.snapshot().get_visible_body().count() as u32,
-                            element: node,
-                        }],
-                    })
-                    .map_err(|e| e.structured())?;
-                Ok(())
+                self.emit_provider_diagnostic(journal, text)
             }
-            ProviderAction::Refresh => self.initialize_provider(journal),
+            ProviderAction::List => {
+                let report = self.provider_report(journal.snapshot());
+                self.emit_provider_diagnostic(journal, report)
+            }
+            ProviderAction::Add {
+                name,
+                endpoint,
+                adapter,
+                key_env,
+                model,
+            } => {
+                let record = ProviderRecord {
+                    name: name.clone(),
+                    adapter,
+                    endpoint: endpoint.clone(),
+                    key_env: key_env.clone(),
+                    model: model.clone().unwrap_or_default(),
+                };
+                // The name doubles as a durable element id; reject the ones that
+                // cannot be one before anything is written.
+                ElementId::new(format!("provider-{name}")).map_err(|_| {
+                    StructuredError::new(
+                        "invalid_provider_name",
+                        "Provider names use 1..128 letters, digits, dots, underscores or hyphens",
+                        false,
+                    )
+                })?;
+                self.record_provider(journal, &record, None)?;
+                // Registration is pure configuration: no fetch happens here, so a
+                // profile or user config may declare providers. Catalogs are
+                // fetched at startup and by /provider refresh.
+                self.emit_provider_diagnostic(
+                    journal,
+                    format!(
+                        "Registered provider '{name}' ({endpoint}). Its catalog is fetched at startup; /provider refresh fetches now. Switch with /provider use {name}."
+                    ),
+                )
+            }
+            ProviderAction::Use { name } => {
+                let Some(record) = self
+                    .providers(journal.snapshot())
+                    .into_iter()
+                    .find(|record| record.name == name)
+                else {
+                    let known: Vec<String> = self
+                        .providers(journal.snapshot())
+                        .into_iter()
+                        .map(|record| record.name)
+                        .collect();
+                    return Err(StructuredError::new(
+                        "provider_not_registered",
+                        format!(
+                            "No provider named '{name}'; configured: {}",
+                            if known.is_empty() { "(none)".to_string() } else { known.join(", ") }
+                        ),
+                        false,
+                    ));
+                };
+                let mut staged = self.convars.clone();
+                for (attribute, value) in [
+                    ("ai_provider", record.adapter.clone()),
+                    ("ai_endpoint", record.endpoint.clone()),
+                    ("ai_api_key_env", record.key_env.clone()),
+                    ("ai_model", record.model.clone()),
+                    ("ai_provider_name", record.name.clone()),
+                ] {
+                    staged.set_from_str(attribute, &value).map_err(|error| {
+                        StructuredError::new("provider_config", error.to_string(), false)
+                    })?;
+                }
+                let mut client = self.provider_from_config(&staged)?;
+                client.model = record.model.clone();
+                let meta = Self::fetch_selection(&mut client, !record.model.is_empty())?;
+                self.commit_provider(journal, client, &record.key_env, Some(meta.clone()), None)?;
+                if let Ok(models) = serde_json::to_value(&meta.models) {
+                    self.record_provider(journal, &record, Some(models))?;
+                }
+                self.emit_provider_diagnostic(
+                    journal,
+                    format!(
+                        "Active provider is now '{name}' ({}); {} models advertised.",
+                        record.endpoint,
+                        meta.models.len()
+                    ),
+                )
+            }
+            ProviderAction::Remove { name } => {
+                let existed = self.forget_provider(journal, &name)?;
+                let active = self.convars.get_typed::<String>("ai_endpoint").unwrap_or_default();
+                let text = if existed {
+                    format!(
+                        "Forgot provider '{name}'. The active settings still point at {active} until /provider use <name> picks another."
+                    )
+                } else {
+                    format!("No provider named '{name}' was recorded.")
+                };
+                self.emit_provider_diagnostic(journal, text)
+            }
+            ProviderAction::Refresh => {
+                self.initialize_provider(journal)?;
+                // Every recorded provider gets a fresh catalog, so the annotated
+                // model list never shows a stale count for an inactive gateway.
+                self.refresh_registered_catalogs(journal, false)
+            }
             ProviderAction::Configure {
                 endpoint,
                 adapter,
@@ -331,6 +725,53 @@ impl SessionHost {
                 self.commit_provider(journal, client, &key_env, Some(meta), None)
             }
         }
+    }
+
+    /// Records the active provider when nothing registered covers it yet, so a
+    /// provider configured through the environment or a profile still appears in
+    /// `/provider list` and can be switched back to by name.
+    fn record_active_provider(
+        &mut self,
+        journal: &mut Journal,
+        client: &ProviderClient,
+        key_env: &str,
+        metadata: Option<&ProviderMetadata>,
+    ) -> Result<(), StructuredError> {
+        let Some(endpoint) = client.endpoint.clone() else {
+            return Ok(());
+        };
+        let declared = self
+            .convars
+            .get_typed::<String>("ai_provider_name")
+            .unwrap_or_default();
+        let existing = self.providers(journal.snapshot());
+        let already = existing
+            .iter()
+            .find(|record| record.matches_endpoint(&client.provider, &endpoint));
+        if let Some(record) = already {
+            // Keep the user's name; refresh the catalog the list shows.
+            if let Some(models) = metadata.and_then(|meta| serde_json::to_value(&meta.models).ok()) {
+                self.record_provider(journal, &record.clone(), Some(models))?;
+            }
+            return Ok(());
+        }
+        let name = if declared.trim().is_empty() {
+            omp_types::endpoint_host(&endpoint)
+        } else {
+            declared.trim().to_string()
+        };
+        if name.is_empty() {
+            return Ok(());
+        }
+        let record = ProviderRecord {
+            name,
+            adapter: client.provider.clone(),
+            endpoint,
+            key_env: key_env.to_string(),
+            model: client.model.clone(),
+        };
+        let models = metadata.and_then(|meta| serde_json::to_value(&meta.models).ok());
+        self.record_provider(journal, &record, models)
     }
 
     fn commit_provider(
@@ -455,8 +896,16 @@ impl SessionHost {
             })
             .map_err(|e| e.structured())?;
         self.convars.hydrate_from_dom(journal.snapshot());
+        let registered = self.record_active_provider(
+            journal,
+            &client,
+            key_env,
+            metadata.as_ref(),
+        );
         self.provider = client;
         self.provider_injected = false;
+        // A registry failure must never invalidate a working provider.
+        let _ = registered;
         Ok(())
     }
 }

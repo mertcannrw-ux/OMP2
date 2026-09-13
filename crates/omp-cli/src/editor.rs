@@ -927,60 +927,123 @@ fn base_command_roster() -> Vec<Completion> {
     ]
 }
 
-/// Generates completion candidates for advertised models under `"/provider select <query>"`.
+/// Generates completion candidates for advertised models under
+/// `"/provider select <query>"`.
+///
+/// The list covers every recorded provider, not just the active one: each entry
+/// names the provider it came from, and selecting a model that belongs to
+/// another provider switches to it first.
 fn model_completions(query: &str, snapshot: &SessionSnapshot) -> Vec<Completion> {
     let query_lower = query.trim().to_lowercase();
+    let records = provider_records(snapshot);
+    let adapter = crate::view::setting(snapshot, "ai_provider");
+    let endpoint = crate::view::setting(snapshot, "ai_endpoint");
+    let registered: Vec<omp_types::ProviderRecord> = records
+        .iter()
+        .map(|(record, _)| record.clone())
+        .collect();
+    let active = omp_types::label_for_endpoint(&registered, &adapter, &endpoint);
     let mut results = Vec::new();
 
+    // The active provider's catalog is the authoritative one: it is what the
+    // session's limits, compaction budget and requests are built from.
     let caps_id = snapshot.container("capabilities");
-    let Some(caps_node) = snapshot.element(caps_id) else {
-        return results;
-    };
-
-    let Some(TypedValue::Json(meta_val)) = caps_node.attributes.get("provider_metadata") else {
-        return results;
-    };
-
-    let Some(models_array) = meta_val.get("models").and_then(|m| m.as_array()) else {
-        return results;
-    };
-
-    for model_val in models_array {
-        let Some(id) = model_val.get("id").and_then(|v| v.as_str()) else {
+    let active_models = snapshot
+        .element(caps_id)
+        .and_then(|node| node.attributes.get("provider_metadata"))
+        .and_then(|value| match value {
+            TypedValue::Json(meta) => meta.get("models").and_then(|m| m.as_array()).cloned(),
+            _ => None,
+        })
+        .unwrap_or_default();
+    for model in &active_models {
+        let Some(id) = model.get("id").and_then(|value| value.as_str()) else {
             continue;
         };
-
-        if !query_lower.is_empty()
-            && !id.to_lowercase().contains(&query_lower)
-            && !query_lower.contains(&id.to_lowercase())
-        {
+        if !matches_query(&query_lower, id, &active, None) {
             continue;
         }
-
-        let context_desc = model_val
-            .get("context_length")
-            .and_then(|v| v.as_u64())
-            .map(|ctx| format!("{}k ctx", ctx / 1000))
-            .unwrap_or_else(|| "advertised model".into());
-
-        let thinking_desc = match model_val
-            .get("thinking_supported")
-            .and_then(|v| v.as_bool())
-        {
-            Some(true) => ", thinking supported",
-            Some(false) => ", no thinking",
-            None => "",
-        };
-
         results.push(Completion {
-            label: format!("/provider select {}", id),
-            description: format!("Select {} ({}{})", id, context_desc, thinking_desc),
-            insert: format!("/provider select {}", id),
+            label: format!("/provider select {id}"),
+            description: format!("{active} · {}{}", describe_model(model), " · active provider"),
+            insert: format!("/provider select {id}"),
             execute: true,
         });
     }
 
+    // Other recorded providers: cached catalogs, annotated with their provider,
+    // and selecting one switches the provider before selecting the model.
+    for (record, models) in &records {
+        if record.matches_endpoint(&adapter, &endpoint) {
+            continue;
+        }
+        for model in models {
+            let Some(id) = model.get("id").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            if !matches_query(&query_lower, id, &record.name, Some(&record.name)) {
+                continue;
+            }
+            results.push(Completion {
+                label: format!("/provider use {}; /provider select {id}", record.name),
+                description: format!(
+                    "{} · {} · switches provider",
+                    record.name,
+                    describe_model(model)
+                ),
+                insert: format!("/provider use {}; /provider select {id}", record.name),
+                execute: true,
+            });
+        }
+    }
+
     results
+}
+
+/// True when `id` or its provider matches what the user typed.
+fn matches_query(query: &str, id: &str, provider: &str, provider_filter: Option<&str>) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let id_lower = id.to_lowercase();
+    let provider_lower = provider.to_lowercase();
+    let extra = provider_filter.map(str::to_lowercase).unwrap_or_default();
+    id_lower.contains(query)
+        || query.contains(&id_lower)
+        || provider_lower.contains(query)
+        || (!extra.is_empty() && extra.contains(query))
+}
+
+/// Context and thinking hints for one catalog entry.
+fn describe_model(model: &serde_json::Value) -> String {
+    let context = model
+        .get("context_length")
+        .and_then(|value| value.as_u64())
+        .map(|context| format!("{}k ctx", context / 1000))
+        .unwrap_or_else(|| "context unknown".into());
+    let thinking = match model.get("thinking_supported").and_then(|v| v.as_bool()) {
+        Some(true) => ", thinking",
+        Some(false) => ", no thinking",
+        None => "",
+    };
+    format!("{context}{thinking}")
+}
+
+/// Recorded providers with their cached catalogs, in registration order.
+fn provider_records(snapshot: &SessionSnapshot) -> Vec<(omp_types::ProviderRecord, Vec<serde_json::Value>)> {
+    snapshot
+        .children(snapshot.container(omp_types::PROVIDERS_CONTAINER))
+        .filter_map(|element| {
+            let record = omp_types::ProviderRecord::from_element(element)?;
+            let models = match element.attributes.get(omp_types::PROVIDER_MODELS_ATTRIBUTE) {
+                Some(TypedValue::Json(value)) => {
+                    value.as_array().cloned().unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+            Some((record, models))
+        })
+        .collect()
 }
 
 /// Discovers aliases and declared convars from `snapshot.session_globals()` and built-in declarations.
@@ -1236,5 +1299,140 @@ mod tests {
         let big = "a".repeat(65537);
         assert!(!editor.insert(&big));
         assert_eq!(editor.text, "");
+    }
+
+    #[test]
+    fn model_list_names_the_provider_each_model_comes_from() {
+        fn set_attribute(
+            snapshot: &mut SessionSnapshot,
+            element: omp_types::ElementId,
+            name: &str,
+            value: TypedValue,
+        ) {
+            let base = snapshot.offset;
+            omp_state::apply_patch(
+                snapshot,
+                &omp_types::Patch {
+                    base_offset: omp_types::JournalOffset(base),
+                    result_offset: omp_types::JournalOffset(base + 1),
+                    by: omp_types::ActorId::new("test-owner").unwrap().into(),
+                    reason: "test".into(),
+                    ops: vec![omp_types::PatchOp::SetAttribute {
+                        element,
+                        name: name.into(),
+                        value,
+                    }],
+                },
+            )
+            .unwrap();
+        }
+        fn create(
+            snapshot: &mut SessionSnapshot,
+            parent: omp_types::ElementId,
+            element: ElementSnapshot,
+        ) {
+            let base = snapshot.offset;
+            omp_state::apply_patch(
+                snapshot,
+                &omp_types::Patch {
+                    base_offset: omp_types::JournalOffset(base),
+                    result_offset: omp_types::JournalOffset(base + 1),
+                    by: omp_types::ActorId::new("test-owner").unwrap().into(),
+                    reason: "test".into(),
+                    ops: vec![omp_types::PatchOp::Create {
+                        parent,
+                        index: 0,
+                        element,
+                    }],
+                },
+            )
+            .unwrap();
+        }
+
+        let mut snapshot = SessionSnapshot::empty(SessionId::new("test-providers").unwrap());
+        let convars = snapshot.container("convars").clone();
+        let capabilities = snapshot.container("capabilities").clone();
+        let providers = snapshot.container(omp_types::PROVIDERS_CONTAINER).clone();
+
+        // Active provider: opencode-go, whose catalog lives in capabilities.
+        set_attribute(
+            &mut snapshot,
+            convars.clone(),
+            "ai_provider",
+            TypedValue::String("openai_compatible".into()),
+        );
+        set_attribute(
+            &mut snapshot,
+            convars,
+            "ai_endpoint",
+            TypedValue::String("https://opencode.ai/zen/go/v1".into()),
+        );
+        set_attribute(
+            &mut snapshot,
+            capabilities,
+            "provider_metadata",
+            TypedValue::Json(serde_json::json!({
+                "provider": "openai_compatible",
+                "endpoint": "https://opencode.ai/zen/go/v1",
+                "models": [
+                    { "id": "glm-5.3-flash", "context_length": 1000000 },
+                    { "id": "kimi-k3", "context_length": 1048576 }
+                ]
+            })),
+        );
+
+        // The active provider is itself registered, so its models are labelled
+        // with the name the user gave it rather than a host fallback.
+        let active_record = omp_types::ProviderRecord {
+            name: "opencode-go".into(),
+            adapter: "openai_compatible".into(),
+            endpoint: "https://opencode.ai/zen/go/v1".into(),
+            key_env: "OPENCODE_GO_API_KEY".into(),
+            model: String::new(),
+        };
+        create(
+            &mut snapshot,
+            providers.clone(),
+            active_record.to_element(omp_types::ElementId::new("provider-opencode-go").unwrap()),
+        );
+
+        // A second provider is recorded with the catalog it was fetched with.
+        let provider = omp_types::ProviderRecord {
+            name: "clawbay".into(),
+            adapter: "openai_compatible".into(),
+            endpoint: "https://api.theclawbay.com/v1".into(),
+            key_env: "OPENAI_API_KEY".into(),
+            model: String::new(),
+        };
+        let mut element = provider.to_element(omp_types::ElementId::new("provider-clawbay").unwrap());
+        element.attributes.insert(
+            omp_types::PROVIDER_MODELS_ATTRIBUTE.into(),
+            TypedValue::Json(serde_json::json!([
+                { "id": "claude-fable-5", "context_length": 200000 }
+            ])),
+        );
+        create(&mut snapshot, providers, element);
+
+        let comps = completions("/provider select ", &snapshot);
+        assert_eq!(comps.len(), 3, "{comps:#?}");
+
+        // The active provider's models are selected directly, and each entry
+        // names the provider it came from.
+        assert_eq!(comps[0].label, "/provider select glm-5.3-flash");
+        assert!(comps[0].description.contains("opencode-go"), "{}", comps[0].description);
+        assert!(comps[0].description.contains("1000k ctx"));
+
+        // A model from another provider switches first, and says so.
+        assert_eq!(
+            comps[2].label,
+            "/provider use clawbay; /provider select claude-fable-5"
+        );
+        assert!(comps[2].description.contains("clawbay"), "{}", comps[2].description);
+        assert!(comps[2].execute);
+
+        // Filtering by provider name narrows to that provider's models.
+        let by_provider = completions("/provider select clawbay", &snapshot);
+        assert_eq!(by_provider.len(), 1);
+        assert!(by_provider[0].label.contains("claude-fable-5"));
     }
 }
