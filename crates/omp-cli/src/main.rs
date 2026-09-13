@@ -366,8 +366,18 @@ pub enum Subcommand {
 pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Option<Subcommand>, CliError> {
     let _prog = args.next(); // skip program name
 
-    let Some(subcmd) = args.next() else {
+    let Some(first) = args.next() else {
         return Ok(None);
+    };
+
+    // Opening the harness is the common gesture, so an invocation that starts
+    // with an option is an implicit `run`: `omp2 --profile opencode-go` has to
+    // work without spelling out the subcommand. A bare `omp2` is handled by the
+    // caller, which defaults to `run` as well.
+    let (subcmd, leading_option) = if first.starts_with('-') {
+        ("run".to_string(), Some(first))
+    } else {
+        (first, None)
     };
 
     let mut common = CommonOptions::default();
@@ -382,7 +392,9 @@ pub fn parse_args<I: Iterator<Item = String>>(mut args: I) -> Result<Option<Subc
     let mut transport = "tcp".to_string();
     let mut once = false;
 
-    let mut peekable = args.peekable();
+    let mut remaining: Vec<String> = leading_option.into_iter().collect();
+    remaining.extend(args);
+    let mut peekable = remaining.into_iter().peekable();
     while let Some(arg) = peekable.next() {
         match arg.as_str() {
             "--journal" => {
@@ -1138,7 +1150,7 @@ fn print_usage() {
 
 LAUNCH:
     omp2                  Start the interactive terminal in the current workspace
-    omp2 run              Equivalent explicit form
+    omp2 [run options]    Same, with run's options (--profile, --cfg, --message, …)
 
 SUBCOMMANDS:
     run       Create a durable session with optional deterministic --message
@@ -1322,5 +1334,52 @@ mod path_policy_tests {
         }
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::remove_dir_all(&user_root);
+    }
+}
+
+#[cfg(test)]
+mod launch_argument_tests {
+    use super::{Subcommand, parse_args};
+
+    fn args(list: &[&str]) -> impl Iterator<Item = String> {
+        list.iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn opening_the_harness_accepts_run_options_without_the_subcommand() {
+        let parsed = parse_args(args(&["omp2", "--profile", "opencode-go"]))
+            .unwrap()
+            .expect("an option-first invocation is an implicit run");
+        match parsed {
+            Subcommand::Run { profile, .. } => {
+                assert_eq!(profile.as_deref(), Some("opencode-go"));
+            }
+            other => panic!("expected run, got {other:?}"),
+        }
+
+        let parsed = parse_args(args(&["omp2", "--cfg", "local.cfg", "--message", "hi"]))
+            .unwrap()
+            .expect("mixed options are still a run");
+        match parsed {
+            Subcommand::Run { cfg, message, .. } => {
+                assert_eq!(cfg.as_deref().map(|path| path.to_string_lossy().to_string()), Some("local.cfg".into()));
+                assert_eq!(message.as_deref(), Some("hi"));
+            }
+            other => panic!("expected run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_subcommands_and_help_are_unchanged() {
+        assert!(matches!(
+            parse_args(args(&["omp2", "resume"])).unwrap(),
+            Some(Subcommand::Resume { .. })
+        ));
+        assert!(parse_args(args(&["omp2", "--help"])).unwrap().is_none());
+        assert!(parse_args(args(&["omp2"])).unwrap().is_none());
+        assert!(parse_args(args(&["omp2", "bogus"])).is_err());
     }
 }

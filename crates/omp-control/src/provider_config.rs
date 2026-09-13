@@ -102,7 +102,9 @@ impl SessionHost {
                     .ok_or_else(|| {
                         StructuredError::new(
                             "missing_credentials",
-                            "The configured API key environment variable is empty or absent",
+                            format!(
+                                "Environment variable {key_env} is empty or absent; set it before starting omp2 (config files store the variable name, never the key)"
+                            ),
                             false,
                         )
                     })?,

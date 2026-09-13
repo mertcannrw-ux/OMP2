@@ -87,6 +87,28 @@ impl Theme {
     }
 }
 
+/// ` @ host` for the configured endpoint, so the status line says which
+/// gateway the model came from. Empty when no endpoint is configured.
+fn gateway_suffix(snapshot: &SessionSnapshot) -> String {
+    let endpoint = setting(snapshot, "ai_endpoint");
+    if endpoint.is_empty() {
+        return String::new();
+    }
+    let host = endpoint
+        .split("://")
+        .nth(1)
+        .unwrap_or(&endpoint)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if host.is_empty() {
+        String::new()
+    } else {
+        format!(" @ {host}")
+    }
+}
+
 pub fn setting(snapshot: &SessionSnapshot, name: &str) -> String {
     snapshot
         .element(snapshot.container("convars"))
@@ -700,6 +722,7 @@ pub fn draw(frame: &mut Frame, state: &mut DrawState, transcript: &mut Transcrip
     let status = Line::from(vec![
         styled("omp2  ·  ", theme.muted),
         styled(model, theme.accent),
+        styled(gateway_suffix(state.snapshot), theme.muted),
         styled("  ·  ", theme.border),
         styled(path, theme.text),
     ]);
