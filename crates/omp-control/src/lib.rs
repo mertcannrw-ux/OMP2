@@ -825,4 +825,36 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[test]
+    fn extra_config_roots_are_the_only_cfgs_outside_the_workspace() {
+        let temp_dir = std::env::temp_dir().join(format!("omp-cfg-roots-{}", ElementId::mint()));
+        let trusted = std::env::temp_dir().join(format!("omp-cfg-trusted-{}", ElementId::mint()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let _ = std::fs::create_dir_all(&trusted);
+        std::fs::write(trusted.join("shared.cfg"), "ai_temperature 0.3\n").unwrap();
+
+        let owner = ActorId::new("owner").unwrap();
+        let mut journal =
+            omp_state::Journal::create(temp_dir.join("session.journal"), SessionId::mint()).unwrap();
+        let mut host = SessionHost::new(temp_dir.clone(), owner.clone()).unwrap();
+        let command = format!("exec {}", trusted.join("shared.cfg").display());
+
+        // Without the extra root, a cfg outside the workspace is refused.
+        let refused = host.execute_command(&mut journal, &command);
+        assert!(refused.is_err(), "outside-workspace cfg must not load by default");
+
+        // With it, the same script applies.
+        let mut trusting = SessionHost::new(temp_dir.clone(), owner)
+            .unwrap()
+            .with_extra_config_root(trusted.clone());
+        trusting.execute_command(&mut journal, &command).unwrap();
+        assert_eq!(
+            journal.snapshot().session_globals()["ai_temperature"],
+            TypedValue::Number(0.3)
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_dir_all(&trusted);
+    }
 }

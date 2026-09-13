@@ -109,6 +109,38 @@ pub mod path_policy {
         }
     }
 
+    /// User-wide configuration root, `~/.omp`: the only configuration a
+    /// globally installed binary can reach from an arbitrary directory.
+    pub fn user_config_root() -> PathBuf {
+        expand_tilde(Path::new("~")).join(".omp")
+    }
+
+    /// Profile locations in precedence order: the workspace's own `profiles/`
+    /// first (a checkout may pin its own settings), then the user-wide root.
+    pub fn profile_candidates(workspace: &Path, name: &str) -> Vec<PathBuf> {
+        vec![
+            workspace.join("profiles").join(format!("{name}.cfg")),
+            user_config_root().join("profiles").join(format!("{name}.cfg")),
+        ]
+    }
+
+    /// Resolves a requested profile, or reports every location that was tried
+    /// instead of silently starting with different settings.
+    pub fn resolve_profile(workspace: &Path, name: &str) -> Result<PathBuf, CliError> {
+        let candidates = profile_candidates(workspace, name);
+        match candidates.iter().find(|path| path.is_file()) {
+            Some(path) => Ok(path.clone()),
+            None => Err(CliError::NotFound(format!(
+                "profile '{name}' not found; looked in {}",
+                candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
     /// Discover workspace root by ascending parent hierarchy looking for markers:
     /// Cargo.toml, .omp, .git, or configs/.
     /// Discover workspace root by ascending parent hierarchy looking for project markers:
@@ -530,7 +562,8 @@ fn create_clean_session(
         )));
     }
     let mut host =
-        omp_control::SessionHost::new(workspace.to_path_buf(), ActorId::new("owner").expect("static actor id"))?;
+        omp_control::SessionHost::new(workspace.to_path_buf(), ActorId::new("owner").expect("static actor id"))?
+            .with_extra_config_root(path_policy::user_config_root());
     host.convars.hydrate_from_dom(previous);
     host.convars = host.convars.seed_child();
     let sid = SessionId::mint();
@@ -741,18 +774,24 @@ pub fn cmd_run(
 
     let mut journal = Journal::create(&journal_path, sid.clone())?;
     let mut host =
-        omp_control::SessionHost::new(workspace.clone(), ActorId::new("owner").expect("static actor id"))?;
+        omp_control::SessionHost::new(workspace.clone(), ActorId::new("owner").expect("static actor id"))?
+            .with_extra_config_root(path_policy::user_config_root());
 
-    // 1. Load default config: configs/config.cfg
+    // 1. Load defaults: the user-wide file first so a checkout's own config
+    // still wins, then configs/config.cfg inside the workspace.
+    apply_cfg_file(
+        &path_policy::user_config_root().join("config.cfg"),
+        &mut host,
+        &mut journal,
+    )?;
     let default_cfg = workspace.join("configs").join("config.cfg");
     apply_cfg_file(&default_cfg, &mut host, &mut journal)?;
 
-    // 2. Load profile cfg if specified: profiles/<profile>.cfg
+    // 2. Load profile cfg if specified: <workspace>/profiles/<profile>.cfg, or
+    // the user-wide ~/.omp/profiles/<profile>.cfg for a global install.
     if let Some(p) = &profile {
-        let profile_cfg = workspace.join("profiles").join(format!("{p}.cfg"));
-        if profile_cfg.exists() {
-            apply_cfg_file(&profile_cfg, &mut host, &mut journal)?;
-        }
+        let profile_cfg = path_policy::resolve_profile(&workspace, p)?;
+        apply_cfg_file(&profile_cfg, &mut host, &mut journal)?;
     }
 
     // 3. Load explicit cfg if specified
@@ -817,7 +856,8 @@ pub fn cmd_resume(common: CommonOptions) -> Result<(), CliError> {
     let journal_path = resolve_target_journal(&common, &workspace)?;
     let mut journal = Journal::open(&journal_path)?;
     let mut host =
-        omp_control::SessionHost::new(workspace.clone(), ActorId::new("owner").expect("static actor id"))?;
+        omp_control::SessionHost::new(workspace.clone(), ActorId::new("owner").expect("static actor id"))?
+            .with_extra_config_root(path_policy::user_config_root());
     if !common.json && tui::interactive() {
         let snapshot = journal.snapshot().clone();
         let refresh = provider_configured(&snapshot);
@@ -1234,5 +1274,53 @@ fn main() -> ExitCode {
             }
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod path_policy_tests {
+    use super::path_policy;
+
+    #[test]
+    fn profiles_resolve_workspace_first_then_user_root() {
+        let workspace = std::env::temp_dir().join(format!("omp-profile-ws-{}", std::process::id()));
+        let user_root = std::env::temp_dir().join(format!("omp-profile-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&user_root);
+        std::fs::create_dir_all(workspace.join("profiles")).unwrap();
+        std::fs::create_dir_all(user_root.join(".omp/profiles")).unwrap();
+        let previous = std::env::var_os("USERPROFILE");
+
+        unsafe {
+            std::env::set_var("USERPROFILE", &user_root);
+        }
+
+        // Only the user-wide copy exists: a global install still finds it.
+        std::fs::write(user_root.join(".omp/profiles/opencode-go.cfg"), "ai_temperature 0.1\n").unwrap();
+        assert_eq!(
+            path_policy::resolve_profile(&workspace, "opencode-go").unwrap(),
+            user_root.join(".omp/profiles/opencode-go.cfg")
+        );
+
+        // The workspace's own copy wins when both exist.
+        std::fs::write(workspace.join("profiles/opencode-go.cfg"), "ai_temperature 0.2\n").unwrap();
+        assert_eq!(
+            path_policy::resolve_profile(&workspace, "opencode-go").unwrap(),
+            workspace.join("profiles/opencode-go.cfg")
+        );
+
+        // A profile that exists nowhere is an error that names the search path,
+        // never a silent start with different settings.
+        let error = path_policy::resolve_profile(&workspace, "absent").unwrap_err();
+        let message = format!("{error}");
+        assert!(message.contains("absent"), "{message}");
+        assert!(message.contains("profiles"), "{message}");
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("USERPROFILE", value) },
+            None => unsafe { std::env::remove_var("USERPROFILE") },
+        }
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&user_root);
     }
 }

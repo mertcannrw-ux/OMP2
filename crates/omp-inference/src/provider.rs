@@ -77,6 +77,20 @@ pub struct ProviderMetadata {
     pub provenance: Option<String>,
 }
 
+/// The client identifies itself to providers: a generic HTTP-library user
+/// agent gets refused by gateways that route agent traffic (OpenCode Go asks
+/// clients to name themselves for exactly this reason).
+pub const CLIENT_USER_AGENT: &str = "omp2/0.1.0";
+
+/// Hosts that require a stable per-conversation id on inference requests.
+///
+/// OpenCode Go rejects a request without `x-opencode-session` outright
+/// (HTTP 400 `MissingSessionID`) and uses the value for routing and prompt
+/// caching, so the header carries the session id the journal already assigns.
+const CONVERSATION_HEADER_HOSTS: &[&str] = &["opencode.ai"];
+/// Header carrying the conversation id for [`CONVERSATION_HEADER_HOSTS`].
+const CONVERSATION_HEADER: &str = "x-opencode-session";
+
 /// Shared provider client contract for semantic request to canonical turn.
 #[derive(Clone, Debug)]
 pub struct ProviderClient {
@@ -91,6 +105,9 @@ pub struct ProviderClient {
     pub tool_force: Option<ToolForcePolicy>,
     pub attempt_count: u32,
     pub metadata: Option<ProviderMetadata>,
+    /// Stable per-conversation id sent to hosts that require one. Set from the
+    /// session the client serves, so replicas and subagents stay distinct.
+    pub conversation_id: Option<String>,
 }
 
 impl ProviderClient {
@@ -108,6 +125,7 @@ impl ProviderClient {
             tool_force: None,
             attempt_count: 0,
             metadata: None,
+            conversation_id: None,
         }
     }
 
@@ -249,6 +267,7 @@ impl ProviderClient {
         });
 
         Ok(Self {
+            conversation_id: None,
             provider: p_str,
             model: m_str,
             ident,
@@ -305,6 +324,51 @@ impl ProviderClient {
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
         self
+    }
+
+    /// Sets the stable id sent to hosts that require a conversation header.
+    pub fn with_conversation_id(mut self, id: impl Into<String>) -> Self {
+        self.conversation_id = Some(id.into());
+        self
+    }
+
+    /// Names this client and its conversation on an outgoing request.
+    ///
+    /// Gateways that route coding-agent traffic reject generic library user
+    /// agents, and some (OpenCode Go) reject a request that carries no
+    /// conversation id outright.
+    fn apply_client_identity(&self, wire_req: &mut ProviderRequest) {
+        wire_req
+            .headers
+            .push(("user-agent".into(), CLIENT_USER_AGENT.to_string()));
+        if Self::requires_conversation_header(&wire_req.endpoint)
+            && let Some(conversation) = &self.conversation_id
+        {
+            wire_req
+                .headers
+                .push((CONVERSATION_HEADER.into(), conversation.clone()));
+        }
+    }
+
+    /// True when this endpoint belongs to a host that requires the
+    /// conversation header on inference requests.
+    fn requires_conversation_header(endpoint: &str) -> bool {
+        let host = endpoint
+            .split("://")
+            .nth(1)
+            .unwrap_or(endpoint)
+            .split(['/', '?'])
+            .next()
+            .unwrap_or("")
+            .rsplit('@')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("");
+        CONVERSATION_HEADER_HOSTS
+            .iter()
+            .any(|known| host.eq_ignore_ascii_case(known) || host.ends_with(&format!(".{known}")))
     }
 
     /// Attaches a cost-aware tool force policy to this client session.
@@ -449,7 +513,7 @@ impl ProviderClient {
         let req = agent
             .get(registry_url)
             .set("accept", "application/json")
-            .set("user-agent", "omp2/0.1.0");
+            .set("user-agent", CLIENT_USER_AGENT);
 
         let resp = match req.call() {
             Ok(resp) => resp,
@@ -567,7 +631,7 @@ impl ProviderClient {
     ) -> Result<serde_json::Value, StructuredError> {
         let mut req = agent.get(url).timeout(remaining);
         req = req.set("accept", "application/json");
-        req = req.set("user-agent", "omp2/0.1.0");
+        req = req.set("user-agent", CLIENT_USER_AGENT);
         if let Some(key) = &self.api_key {
             if self.provider == "anthropic" {
                 req = req
@@ -760,6 +824,7 @@ impl ProviderClient {
         if let Some(ep) = &self.endpoint {
             wire_req.endpoint = resolve_turn_endpoint(ep, wire_req.wire_format);
         }
+        self.apply_client_identity(&mut wire_req);
         // Inject authentication headers from environment
         if let Some(key) = &self.api_key {
             match wire_req.wire_format {
@@ -2998,5 +3063,74 @@ mod tests {
             assert_eq!(prov, None);
             assert_eq!(models[0].context_length, None);
         }
+    }
+
+    #[test]
+    fn client_identity_headers_follow_the_endpoint() {
+        let mut wire = ProviderRequest {
+            endpoint: "https://opencode.ai/zen/go/v1/chat/completions".into(),
+            headers: Vec::new(),
+            body: serde_json::json!({}),
+            native_tool_choice_used: false,
+            soft_instruction_injected: false,
+            wire_format: WireFormat::OpenAiChatCompletions,
+        };
+
+        let client = ProviderClient::new(
+            "openai_compatible",
+            "glm-5.3-flash",
+            Some("https://opencode.ai/zen/go/v1".into()),
+        )
+        .unwrap()
+        .with_conversation_id("session-abc");
+        client.apply_client_identity(&mut wire);
+        let header = |name: &str| {
+            wire.headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(header("user-agent").as_deref(), Some(CLIENT_USER_AGENT));
+        assert_eq!(header("x-opencode-session").as_deref(), Some("session-abc"));
+
+        // A host that does not ask for a conversation id never sees one.
+        let mut elsewhere = ProviderRequest {
+            endpoint: "https://api.example.com/v1/chat/completions".into(),
+            ..wire.clone()
+        };
+        elsewhere.headers.clear();
+        client.apply_client_identity(&mut elsewhere);
+        assert!(
+            !elsewhere
+                .headers
+                .iter()
+                .any(|(key, _)| key == "x-opencode-session")
+        );
+        assert!(
+            elsewhere
+                .headers
+                .iter()
+                .any(|(key, value)| key == "user-agent" && value == CLIENT_USER_AGENT)
+        );
+
+        // Missing conversation id: identity only.
+        let mut anonymous = ProviderRequest {
+            endpoint: "https://opencode.ai/zen/go/v1/chat/completions".into(),
+            ..wire.clone()
+        };
+        anonymous.headers.clear();
+        ProviderClient::new(
+            "openai_compatible",
+            "glm-5.3-flash",
+            Some("https://opencode.ai/zen/go/v1".into()),
+        )
+        .unwrap()
+        .apply_client_identity(&mut anonymous);
+        assert!(
+            !anonymous
+                .headers
+                .iter()
+                .any(|(key, _)| key == "x-opencode-session")
+        );
     }
 }

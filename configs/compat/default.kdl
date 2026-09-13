@@ -5,6 +5,12 @@ rule "anthropic-claude" host="api.anthropic.com" provider="anthropic" family="cl
 
 rule "openai-gpt" host="api.openai.com" provider="openai" family="gpt" priority=10 cost="costly" streaming="supported" native_tool_choice="supported" developer_role="supported" constrained_sampling="supported" usage_query="supported"
 
+# OpenCode Go (opencode.ai/zen) — OpenAI-compatible gateway for open coding
+# models. Verified against the live endpoint: SSE streaming, native tool
+# choice, developer role, mid-session system messages and json_schema output
+# are all accepted; requests must name the client and carry a conversation id.
+rule "opencode-go" host="opencode.ai" priority=10 cost="free" streaming="supported" native_tool_choice="supported" developer_role="supported" mid_session_system_prompts="supported" constrained_sampling="supported"
+
 rule "class-reasoning" class="reasoning" priority=1 cost="unknown" constrained_sampling="unsupported"
 
 rule "class-fast" class="fast" priority=1 cost="free" streaming="supported" native_tool_choice="supported"

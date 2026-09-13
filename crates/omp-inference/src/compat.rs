@@ -225,18 +225,26 @@ pub struct CompatRule {
 }
 
 impl CompatRule {
-    /// Determines the structural specificity level (0..=5).
+    /// Determines the structural specificity level (0..=6).
     /// Precedence order:
-    /// 5: exact host + exact model revision
-    /// 4: host + family
+    /// 6: exact host + exact model revision
+    /// 5: host + family
+    /// 4: exact host
     /// 3: provider + revision
     /// 2: provider + family
     /// 1: class defaults
     /// 0: unknown / global wildcard
+    ///
+    /// A named host outranks every heuristic derived from the model id: an
+    /// operator who recorded what a specific endpoint supports knows more than
+    /// a `-flash` suffix does, and losing that comparison made host rules
+    /// silently ineffective for fast/mini models.
     pub fn specificity_level(&self) -> u8 {
         if self.host.is_some() && matches!(self.revision, Some(RevisionPattern::Exact(_))) {
-            5
+            6
         } else if self.host.is_some() && self.family.is_some() {
+            5
+        } else if self.host.is_some() {
             4
         } else if self.provider.is_some() && self.revision.is_some() {
             3
@@ -466,7 +474,7 @@ impl CompatCompiler {
     /// Compiles all rules into a deterministic indexed table.
     pub fn compile(mut self) -> Result<CompatTable, CompatError> {
         // Sort deterministically:
-        // Highest specificity first (5 down to 0),
+        // Highest specificity first (6 down to 0),
         // then highest priority first,
         // then stable alphabetical ID for complete determinism (file order never wins).
         self.rules.sort_by(|a, b| {
@@ -723,7 +731,36 @@ impl CompatTable {
             })
             .expect("hardcoded standard rule must be valid");
 
-        // 2. OpenAI Direct
+        // 2. OpenCode Go (opencode.ai/zen) — OpenAI-compatible gateway for open
+        // coding models. Verified against the live endpoint: SSE streaming,
+        // native tool choice, developer role, mid-session system messages and
+        // json_schema output are accepted; requests must identify the client
+        // and carry a conversation id (see ProviderClient::apply_client_identity).
+        let mut opencode_caps = HashMap::new();
+        opencode_caps.insert(ProviderCapability::Streaming, TriState::Supported);
+        opencode_caps.insert(ProviderCapability::NativeToolChoice, TriState::Supported);
+        opencode_caps.insert(ProviderCapability::DeveloperRole, TriState::Supported);
+        opencode_caps.insert(
+            ProviderCapability::MidSessionSystemPrompts,
+            TriState::Supported,
+        );
+        opencode_caps.insert(ProviderCapability::ConstrainedSampling, TriState::Supported);
+
+        compiler
+            .add_rule(CompatRule {
+                id: "opencode-go".into(),
+                host: Some("opencode.ai".into()),
+                provider: None,
+                family: None,
+                revision: None,
+                class: None,
+                capabilities: opencode_caps,
+                native_tool_cost: Some(NativeToolCost::Free),
+                priority: 10,
+            })
+            .expect("hardcoded standard rule must be valid");
+
+        // 3. OpenAI Direct
         let mut openai_caps = HashMap::new();
         openai_caps.insert(ProviderCapability::Streaming, TriState::Supported);
         openai_caps.insert(ProviderCapability::NativeToolChoice, TriState::Supported);
@@ -745,7 +782,7 @@ impl CompatTable {
             })
             .expect("hardcoded standard rule must be valid");
 
-        // 3. Class defaults (Level 1)
+        // 4. Class defaults (Level 1)
         let mut reasoning_caps = HashMap::new();
         reasoning_caps.insert(
             ProviderCapability::ConstrainedSampling,
@@ -772,11 +809,12 @@ impl CompatTable {
     }
 
     /// Resolves capabilities for a model identifier following strict precedence ladder:
-    /// 1. Exact host + exact model revision (specificity 5)
-    /// 2. Host + family (specificity 4)
-    /// 3. Provider + revision (specificity 3)
-    /// 4. Provider + family (specificity 2)
-    /// 5. Class defaults (specificity 1)
+    /// 1. Exact host + exact model revision (specificity 6)
+    /// 2. Host + family (specificity 5)
+    /// 3. Exact host (specificity 4)
+    /// 4. Provider + revision (specificity 3)
+    /// 5. Provider + family (specificity 2)
+    /// 6. Class defaults (specificity 1)
     /// 6. Unknown fallback (specificity 0)
     pub fn resolve(&self, ident: &ModelIdentifier) -> CapabilityProfile {
         let mut profile = CapabilityProfile::new();
@@ -933,6 +971,70 @@ rule "generic-class" class="fast" priority=1 streaming="supported"
         // Higher precedence rule specified streaming="unknown", so it must be TriState::Unknown, not overridden by fast class
         assert_eq!(
             profile.get(ProviderCapability::Streaming),
+            TriState::Unknown
+        );
+    }
+
+    #[test]
+    fn host_rules_outrank_class_heuristics() {
+        let mut compiler = CompatCompiler::new();
+        let kdl = r#"
+rule "class-fast" class="fast" priority=1 streaming="supported" native_tool_choice="unsupported"
+rule "opencode-go" host="opencode.ai" priority=10 streaming="supported" native_tool_choice="supported"
+"#;
+        compiler.parse_kdl_text(kdl).unwrap();
+        let table = compiler.compile().unwrap();
+        // A model the id heuristics call "fast" on a host we have a rule for:
+        // the host rule must decide, not the suffix.
+        let ident = ModelIdentifier::new(
+            crate::model_taxonomy::ModelTaxonomy::from_model_id("glm-5.3-flash"),
+            ModelClass::Fast,
+            crate::model_taxonomy::ProviderRoute::Custom {
+                provider_name: "openai_compatible".into(),
+                host: "opencode.ai".into(),
+            },
+        );
+        let profile = table.resolve(&ident);
+        assert_eq!(
+            profile.get(ProviderCapability::NativeToolChoice),
+            TriState::Supported,
+            "the host rule wins over the class heuristic"
+        );
+        assert_eq!(profile.get(ProviderCapability::Streaming), TriState::Supported);
+    }
+
+    #[test]
+    fn standard_table_covers_the_opencode_go_gateway() {
+        let table = CompatTable::standard();
+        let ident = ModelIdentifier::new(
+            crate::model_taxonomy::ModelTaxonomy::from_model_id("glm-5.3-flash"),
+            ModelClass::Fast,
+            crate::model_taxonomy::ProviderRoute::Custom {
+                provider_name: "openai_compatible".into(),
+                host: "opencode.ai".into(),
+            },
+        );
+        let profile = table.resolve(&ident);
+        for capability in [
+            ProviderCapability::Streaming,
+            ProviderCapability::NativeToolChoice,
+            ProviderCapability::DeveloperRole,
+            ProviderCapability::MidSessionSystemPrompts,
+            ProviderCapability::ConstrainedSampling,
+        ] {
+            assert_eq!(
+                profile.get(capability),
+                TriState::Supported,
+                "{capability} is declared for the gateway"
+            );
+        }
+        // Endpoints the gateway does not expose stay unknown rather than guessed.
+        assert_eq!(
+            profile.get(ProviderCapability::TokenCount),
+            TriState::Unknown
+        );
+        assert_eq!(
+            profile.get(ProviderCapability::UsageQuery),
             TriState::Unknown
         );
     }

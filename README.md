@@ -348,6 +348,14 @@ Profiles are `.cfg` scripts in [`profiles/`](profiles):
 | `factory` | Autonomous software factory — untrusted repository, hostile isolation, network off, 2 concurrent jobs. |
 | `remote` | Remote interactive driver. |
 | `spectator` | Read-only observer. |
+| `opencode-go` | OpenCode Go subscription (open coding models, `https://opencode.ai/zen/go/v1`). |
+
+`--profile <name>` resolves `<workspace>/profiles/<name>.cfg` first and then
+`~/.omp/profiles/<name>.cfg`, so a globally installed `omp2` can be given a profile from
+any directory; a profile that exists in neither place is an error naming both paths rather
+than a session that quietly starts with different settings. The same rule applies to
+defaults: `~/.omp/config.cfg` is loaded before `<workspace>/configs/config.cfg`, so a
+checkout can still override the machine-wide file.
 
 ### Provider compatibility rules
 
@@ -363,7 +371,13 @@ rule "anthropic-claude" host="api.anthropic.com" provider="anthropic" family="cl
 
 `CompatCompiler` turns these into a `CompatTable`; `omp-inference` consults it through
 `TriState` capability profiles before every request. Rules may match on `host`,
-`provider`, `family`, or model `class`, with `priority` resolving conflicts.
+`provider`, `family`, or model `class`, with `priority` resolving conflicts — and an
+exact `host` outranks every heuristic derived from the model id, so a rule recorded for a
+specific gateway is never overridden by a `-flash`/`-mini` suffix.
+
+The KDL file is the declarative mirror of the table the binary ships: `CompatTable::standard()`
+in `crates/omp-inference/src/compat.rs` builds the same rules in code, and that is what
+production consults. Keep the two in step when adding a provider.
 
 ---
 
@@ -395,6 +409,26 @@ limits are never guessed.
 
 API keys are read from the host environment and are never placed in console commands or
 config files.
+
+### OpenCode Go
+
+[OpenCode Go](https://opencode.ai/docs/go/) serves open coding models on a flat
+$10/month subscription. It is OpenAI-compatible but requires two things of a client:
+it must identify itself with its own user agent, and every inference request must carry a
+stable conversation id in `x-opencode-session` — without it the gateway answers
+`HTTP 400 MissingSessionID`. `ProviderClient` sends `omp2/0.1.0` on every request and the
+session id on `x-opencode-session` for hosts that ask for it, so the endpoint works
+without a wrapper:
+
+```bash
+setx OPENCODE_GO_API_KEY "…"        # once; read from the environment, never from a file
+omp2 run --profile opencode-go
+```
+
+`profiles/opencode-go.cfg` pins the adapter, endpoint, key variable and a default model
+(`glm-5.3-flash`); `/provider select <id>` switches models for the session and
+`/provider` lists the catalog. The profile is installed to `~/.omp/profiles/` as well, so
+`--profile opencode-go` works from any directory.
 
 ---
 

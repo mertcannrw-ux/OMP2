@@ -40,6 +40,10 @@ pub struct SessionHost {
     pub provider: ProviderClient,
     pub tool_host: ToolHost,
     pub compaction_guard: SpeculativeCompactionGuard,
+    /// Additional roots whose `.cfg` scripts this host may execute, beyond the
+    /// workspace. The CLI puts the user-wide config root here so a globally
+    /// installed binary can load `~/.omp/config.cfg` and its profiles.
+    pub extra_config_roots: Vec<PathBuf>,
     pub max_turn_steps: usize,
     pub(crate) children: BTreeMap<ElementId, crate::children::ChildHandle>,
     pub(crate) cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -73,6 +77,7 @@ impl SessionHost {
             provider,
             tool_host,
             compaction_guard: SpeculativeCompactionGuard::new(),
+            extra_config_roots: Vec::new(),
             max_turn_steps: 20,
             children: BTreeMap::new(),
             cancellation: None,
@@ -92,6 +97,12 @@ impl SessionHost {
     pub fn with_provider_client(mut self, client: ProviderClient) -> Self {
         self.provider = client;
         self.provider_injected = true;
+        self
+    }
+
+    /// Trusts one more directory for `exec` of `.cfg` scripts.
+    pub fn with_extra_config_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.extra_config_roots.push(root.into());
         self
     }
 
@@ -115,6 +126,10 @@ impl SessionHost {
         self.convars.hydrate_from_dom(journal.snapshot());
         self.refresh_provider()?;
         self.restore_provider_metadata(journal.snapshot())?;
+        // Every inference request names the conversation it belongs to: hosts
+        // that route agent traffic key caching and rate limiting on it, and a
+        // subagent's own journal gives it a distinct id.
+        self.provider.conversation_id = Some(journal.snapshot().session_id.to_string());
         if !self.provider_injected
             && journal
                 .snapshot()
@@ -490,11 +505,17 @@ impl SessionHost {
                     .workspace
                     .canonicalize()
                     .map_err(|e| crate::command::CommandError::Parse(e.to_string()))?;
+                let allowed: Vec<PathBuf> = self
+                    .extra_config_roots
+                    .iter()
+                    .filter_map(|candidate| candidate.canonicalize().ok())
+                    .collect();
                 let path = root
                     .join(path)
                     .canonicalize()
                     .map_err(|e| crate::command::CommandError::Parse(e.to_string()))?;
-                if !path.starts_with(&root) {
+                if !path.starts_with(&root) && !allowed.iter().any(|extra| path.starts_with(extra))
+                {
                     return Err(crate::command::CommandError::Parse(
                         "cfg is outside the workspace".into(),
                     ));
@@ -697,6 +718,7 @@ impl SessionHost {
         let mut inherited = self.convars.clone();
         inherited.hydrate_from_dom(parent_snapshot);
         let mut child = SessionHost::new(child_workspace, child_owner)?;
+        child.extra_config_roots = self.extra_config_roots.clone();
         child.convars = inherited.seed_child();
         let mut ops = child
             .convars
