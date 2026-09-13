@@ -999,6 +999,19 @@ pub fn register_builtin_convars(store: &mut ConVarStore) {
 
     store.register(
         ConVar::new(
+            "ai_request_timeout_secs",
+            300_i64,
+            "Idle budget in seconds for a provider request before the stream is treated as stalled",
+            session_replicated,
+        )
+        .with_validator(|v| match v {
+            TypedValue::Integer(i) if (10..=1800).contains(i) => Ok(()),
+            _ => Err("ai_request_timeout_secs must be between 10 and 1800".into()),
+        }),
+    );
+
+    store.register(
+        ConVar::new(
             "tool_max_runtime_ms",
             300_000_i64,
             "Maximum runtime in milliseconds for a tool before timeout",

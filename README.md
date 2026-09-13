@@ -335,6 +335,7 @@ replicated with the session.
 | `ai_endpoint`, `ai_provider`, `ai_model`, `ai_api_key_env` | Provider routing. |
 | `ai_temperature`, `ai_max_tokens`, `ai_context_length`, `ai_compaction_threshold` | Sampling and context management. |
 | `ai_thinking`, `ai_thinking_levels`, `ai_fastmode` | Reasoning controls. |
+| `ai_request_timeout_secs` | Idle budget for one provider request (10–1800 s, default 300). |
 | `cl_theme`, `cl_icon_mode`, `cl_showthinking`, `cl_resize_policy` | Terminal presentation. |
 | `sandbox_network`, `sandbox_write_scope` | Sandbox grants. |
 | `job_max_concurrency`, `tool_max_output_bytes`, `tool_max_runtime_ms` | Resource limits. |
@@ -396,6 +397,13 @@ preset is selected for you. In the console, `/provider` shows the catalog and ef
 settings, `/provider select <id>` chooses a discovered model, and `/provider refresh`
 refetches after a discovery failure. Missing provider metadata stays `unknown` — model
 limits are never guessed.
+
+A stream that produces nothing for `ai_request_timeout_secs` (default 300) is treated as
+stalled: the turn fails with `stream_stalled` rather than hanging forever, and the request
+is re-issued once when the stall happened before any output reached the session. Raising
+the convar is the answer when a model reasons for longer than that between tokens; after
+the first token a stall is never retried, because a replay would duplicate text.
+Connecting has its own short timeout, so an unreachable endpoint fails in seconds.
 
 | Environment variable | Purpose |
 | --- | --- |

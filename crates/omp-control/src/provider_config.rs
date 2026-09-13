@@ -80,6 +80,13 @@ impl SessionHost {
         }
         let mut client =
             ProviderClient::new(adapter, model, (!endpoint.is_empty()).then_some(endpoint))?;
+        // A stream that produces nothing for this long is treated as stalled;
+        // reasoning models can pause for minutes, so it is a session setting.
+        if let Ok(timeout) = store.get_typed::<i64>("ai_request_timeout_secs")
+            && timeout > 0
+        {
+            client = client.with_timeout(timeout as u64);
+        }
         let key_env = store
             .get_typed::<String>("ai_api_key_env")
             .unwrap_or_default();

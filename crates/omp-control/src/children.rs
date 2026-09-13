@@ -98,7 +98,10 @@ impl SessionHost {
                 task["agent"].as_str(),
             )?;
             child.provider.endpoint = self.provider.endpoint.clone();
-            child.provider.timeout_secs = child.provider.timeout_secs.min(30);
+            let parent_timeout = self.provider.timeout_secs;
+            // Children inherit the parent's idle budget: a subagent streams from
+            // the same provider, and 30 seconds kills a reasoning pause.
+            child.provider.timeout_secs = parent_timeout;
             let cancellation = Arc::new(AtomicBool::new(false));
             child.cancellation = Some(cancellation.clone());
             let mut node = ElementSnapshot::new(element.clone(), "subagent");

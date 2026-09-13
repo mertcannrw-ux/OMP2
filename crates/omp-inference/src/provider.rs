@@ -91,6 +91,16 @@ const CONVERSATION_HEADER_HOSTS: &[&str] = &["opencode.ai"];
 /// Header carrying the conversation id for [`CONVERSATION_HEADER_HOSTS`].
 const CONVERSATION_HEADER: &str = "x-opencode-session";
 
+/// Idle budget for a provider request: the time a stream may produce nothing
+/// before it is treated as stalled. Reasoning models routinely pause for
+/// minutes between tokens on a hard prompt, and a gateway may hold the stream
+/// while it queues, so this is minutes rather than seconds.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+/// Fast failure for an unreachable endpoint: connecting is never slow.
+pub const CONNECT_TIMEOUT_SECS: u64 = 15;
+pub const MIN_REQUEST_TIMEOUT_SECS: u64 = 10;
+pub const MAX_REQUEST_TIMEOUT_SECS: u64 = 1800;
+
 /// Shared provider client contract for semantic request to canonical turn.
 #[derive(Clone, Debug)]
 pub struct ProviderClient {
@@ -120,7 +130,7 @@ impl ProviderClient {
             caps: CapabilityProfile::default(),
             api_key: None,
             endpoint: None,
-            timeout_secs: 60,
+            timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             max_response_bytes: 10 * 1024 * 1024,
             tool_force: None,
             attempt_count: 0,
@@ -274,7 +284,7 @@ impl ProviderClient {
             caps,
             api_key,
             endpoint: validated_endpoint,
-            timeout_secs: 60,
+            timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
             max_response_bytes: 10 * 1024 * 1024,
             tool_force: None,
             attempt_count: 0,
@@ -308,9 +318,10 @@ impl ProviderClient {
         }
     }
 
-    /// Sets the network read/write timeout in seconds, clamped to 1..=300.
+    /// Sets the idle read/write timeout in seconds, clamped to
+    /// `MIN_REQUEST_TIMEOUT_SECS..=MAX_REQUEST_TIMEOUT_SECS`.
     pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
-        self.timeout_secs = timeout_secs.clamp(1, 300);
+        self.timeout_secs = timeout_secs.clamp(MIN_REQUEST_TIMEOUT_SECS, MAX_REQUEST_TIMEOUT_SECS);
         self
     }
 
@@ -845,13 +856,37 @@ impl ProviderClient {
             wire_req.body["stream"] = serde_json::json!(true);
         }
 
-        // 3. Execute bounded HTTP request
-        let (raw_text, mut thinking, raw_tool_calls, usage, finish_reason) = execute_wire_request(
-            &wire_req,
-            self.timeout_secs,
-            self.max_response_bytes,
-            on_delta,
-        )?;
+        // 3. Execute bounded HTTP request.
+        //
+        // A stall before the first token is retried once: nothing has reached the
+        // session yet, so re-issuing the same request cannot duplicate output, and
+        // a provider that stalls once usually answers the second attempt. After
+        // the first delta a retry would duplicate text, so the failure surfaces.
+        let mut emitted = false;
+        let mut stall_retried = false;
+        let (raw_text, mut thinking, raw_tool_calls, usage, finish_reason) = loop {
+            let mut observer = |delta: InferenceDelta<'_>| {
+                emitted = true;
+                on_delta(delta)
+            };
+            match execute_wire_request(
+                &wire_req,
+                self.timeout_secs,
+                self.max_response_bytes,
+                &mut observer,
+            ) {
+                Ok(parsed) => break parsed,
+                Err(error) => {
+                    let retryable = !emitted
+                        && !stall_retried
+                        && matches!(error.code.as_str(), "stream_stalled" | "network_error");
+                    if !retryable {
+                        return Err(error);
+                    }
+                    stall_retried = true;
+                }
+            }
+        };
 
         // 4. Corrective: normalize thinking tokens if not already separated
         let mut text = raw_text;
@@ -1734,7 +1769,13 @@ fn execute_wire_request(
     on_delta: &mut dyn FnMut(InferenceDelta<'_>) -> Result<(), StructuredError>,
 ) -> ParsedTurnResult {
     let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(timeout_secs.clamp(1, 300)))
+        .timeout_connect(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .timeout_read(Duration::from_secs(
+            timeout_secs.clamp(MIN_REQUEST_TIMEOUT_SECS, MAX_REQUEST_TIMEOUT_SECS),
+        ))
+        .timeout_write(Duration::from_secs(
+            timeout_secs.clamp(MIN_REQUEST_TIMEOUT_SECS, MAX_REQUEST_TIMEOUT_SECS),
+        ))
         .redirects(0)
         .build();
     let mut request = agent.post(&req.endpoint);
@@ -1792,11 +1833,21 @@ pub(crate) fn parse_sse_stream<R: BufRead>(
             .take(remaining)
             .read_line(&mut line_buf)
             .map_err(|e| {
-                StructuredError::new(
-                    "stream_read_failed",
-                    format!("Error reading SSE stream: {e}"),
-                    true,
-                )
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    StructuredError::new(
+                        "stream_stalled",
+                        format!(
+                            "The provider sent nothing for the whole request budget ({e}); the model may still be reasoning, or the gateway stopped forwarding. Raise ai_request_timeout_secs if this model needs longer pauses."
+                        ),
+                        true,
+                    )
+                } else {
+                    StructuredError::new(
+                        "stream_read_failed",
+                        format!("Error reading SSE stream: {e}"),
+                        true,
+                    )
+                }
             })?;
         if bytes_read == 0 {
             break;
@@ -3132,5 +3183,179 @@ mod tests {
                 .iter()
                 .any(|(key, _)| key == "x-opencode-session")
         );
+    }
+
+    /// Reads one full HTTP request off `stream`, so a server that closes right
+    /// after replying never resets a connection with unread input.
+    fn read_full_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::{BufRead as _, Read as _};
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut length = 0usize;
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap_or(0);
+            }
+            head.push_str(&line);
+        }
+        let mut body = vec![0u8; length];
+        let _ = reader.read_exact(&mut body);
+        head
+    }
+
+    #[test]
+    fn a_stall_before_any_output_is_retried_once() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut accepted = 0;
+            // First connection: accept and drop without answering, which is what
+            // a gateway does when it gives up on a queued request.
+            if let Ok((mut stream, _)) = listener.accept() {
+                accepted += 1;
+                read_full_request(&mut stream);
+                drop(stream);
+            }
+            // Second connection: a normal completion.
+            if let Ok((mut stream, _)) = listener.accept() {
+                accepted += 1;
+                read_full_request(&mut stream);
+                let body = serde_json::json!({
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "recovered"}, "finish_reason": "stop"}],
+                    "usage": {"total_tokens": 3}
+                })
+                .to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+            accepted
+        });
+
+        let mut client = ProviderClient::new(
+            "openai_compatible",
+            "test-model",
+            Some(format!("http://127.0.0.1:{port}/v1")),
+        )
+        .unwrap()
+        .with_api_key("test-key");
+        client
+            .caps
+            .set(ProviderCapability::Streaming, TriState::Unsupported);
+
+        let mut request = InferenceRequest::default();
+        request
+            .messages
+            .push(crate::request::SemanticMessage::user("hello"));
+        let turn = client
+            .infer(&request, &mut |_| Ok(()))
+            .expect("a dropped connection before any output is retried");
+        assert_eq!(turn.text, "recovered");
+        assert_eq!(server.join().unwrap(), 2, "the request was re-issued exactly once");
+    }
+
+    #[test]
+    fn a_stall_after_output_is_not_retried() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let mut accepted = 0;
+            if let Ok((mut stream, _)) = listener.accept() {
+                accepted += 1;
+                read_full_request(&mut stream);
+                // Emit one delta, then drop: retrying here would duplicate text.
+                let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+            }
+            accepted
+        });
+
+        let mut client = ProviderClient::new(
+            "openai_compatible",
+            "test-model",
+            Some(format!("http://127.0.0.1:{port}/v1")),
+        )
+        .unwrap()
+        .with_api_key("test-key");
+
+        let mut request = InferenceRequest::default();
+        request
+            .messages
+            .push(crate::request::SemanticMessage::user("hello"));
+        let error = client
+            .infer(&request, &mut |_| Ok(()))
+            .expect_err("a truncated stream is an error, not a silent success");
+        assert!(
+            matches!(error.code.as_str(), "premature_stream_termination" | "stream_read_failed"),
+            "unexpected code {}",
+            error.code
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            1,
+            "output already reached the session; the request must not be replayed"
+        );
+    }
+
+    #[test]
+    fn an_idle_timeout_names_the_budget_that_expired() {
+        struct Stalling;
+        impl std::io::Read for Stalling {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "timed out reading response",
+                ))
+            }
+        }
+        let mut reader = std::io::BufReader::new(Stalling);
+        let error = parse_sse_stream(
+            &mut reader,
+            WireFormat::OpenAiChatCompletions,
+            1024,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "stream_stalled");
+        assert!(
+            error.message.contains("ai_request_timeout_secs"),
+            "the error must name the setting that can raise the budget: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn request_timeout_defaults_and_clamps() {
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT_SECS, 300);
+        let client = ProviderClient::new(
+            "openai_compatible",
+            "m",
+            Some("http://127.0.0.1:8000/v1".into()),
+        )
+        .unwrap();
+        assert_eq!(client.timeout_secs, DEFAULT_REQUEST_TIMEOUT_SECS);
+        assert_eq!(client.clone().with_timeout(5).timeout_secs, MIN_REQUEST_TIMEOUT_SECS);
+        assert_eq!(client.clone().with_timeout(9_000).timeout_secs, MAX_REQUEST_TIMEOUT_SECS);
+        assert_eq!(client.with_timeout(600).timeout_secs, 600);
     }
 }
