@@ -334,7 +334,7 @@ replicated with the session.
 | --- | --- |
 | `ai_endpoint`, `ai_provider`, `ai_model`, `ai_api_key_env` | Provider routing. |
 | `ai_temperature`, `ai_max_tokens`, `ai_context_length`, `ai_compaction_threshold` | Sampling and context management. |
-| `ai_thinking`, `ai_thinking_levels`, `ai_fastmode` | Reasoning controls. |
+| `ai_thinking`, `ai_thinking_levels`, `ai_fastmode` | Reasoning controls; `/effort` sets the first. |
 | `ai_request_timeout_secs` | Idle budget for one provider request (10–1800 s, default 300). |
 | `cl_theme`, `cl_icon_mode`, `cl_showthinking`, `cl_resize_policy` | Terminal presentation. |
 | `sandbox_network`, `sandbox_write_scope` | Sandbox grants. |
@@ -404,6 +404,34 @@ is re-issued once when the stall happened before any output reached the session.
 the convar is the answer when a model reasons for longer than that between tokens; after
 the first token a stall is never retried, because a replay would duplicate text.
 Connecting has its own short timeout, so an unreachable endpoint fails in seconds.
+
+### Reasoning effort
+
+`/effort` is the console surface for how hard the model thinks. It reports the level in
+force, the levels the active model actually advertises, and the provider's default:
+
+```
+/effort            Reasoning effort: auto  ·  model: glm-5.3-flash
+                   Advertised levels: low, medium, high  ·  provider default: medium
+                   Set with /effort <level>; 'auto' leaves the choice to the provider,
+                   'off' disables reasoning.
+/effort high       Reasoning effort set to 'high' (provider default: medium).
+```
+
+Typing `/effort ` lists the advertised levels as completions, marking the provider default
+and the current choice. A level the model does not advertise is refused at the console —
+`unsupported_thinking_level` naming the levels that do exist — instead of failing a turn
+later. `auto` and `off` always apply; `auto` sends no effort field at all, leaving the
+choice to the provider.
+
+The status footer shows what is in force, including what `auto` resolves to:
+
+```
+main  ·  3 turns  ·  context 1000000  ·  effort high  ·  /help
+main  ·  3 turns  ·  context 1000000  ·  effort auto (medium)  ·  /help
+```
+
+A model that advertises no effort levels shows no indicator rather than a guess.
 
 ### Multiple providers
 

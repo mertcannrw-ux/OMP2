@@ -57,6 +57,130 @@ fn summarize_provider_metadata(meta: &serde_json::Value) -> String {
 }
 
 impl SessionHost {
+    /// Reasoning effort levels the active model advertises, as journaled by the
+    /// last provider refresh.
+    fn advertised_thinking_levels(&self) -> Vec<String> {
+        match self.convars.get("ai_thinking_levels") {
+            Some(TypedValue::Json(value)) => value
+                .as_array()
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(|level| level.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Effort the provider uses when nothing is requested, if it advertises one.
+    fn advertised_thinking_default(&self, snapshot: &omp_state::SessionSnapshot) -> Option<String> {
+        snapshot
+            .element(snapshot.container("capabilities"))
+            .and_then(|node| node.attributes.get("provider_metadata"))
+            .and_then(|value| match value {
+                TypedValue::Json(metadata) => metadata
+                    .pointer("/active_model/thinking_default")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+                _ => None,
+            })
+    }
+
+    /// Reports or sets the reasoning effort for the active model.
+    ///
+    /// The level is checked against what the model advertises *before* it is
+    /// written, so a typo is answered at the console instead of failing a turn
+    /// with `unsupported_thinking_level`.
+    pub(crate) fn execute_effort_command(
+        &mut self,
+        journal: &mut Journal,
+        level: Option<String>,
+    ) -> Result<(), StructuredError> {
+        let advertised = self.advertised_thinking_levels();
+        let default = self.advertised_thinking_default(journal.snapshot());
+        let current = self
+            .convars
+            .get_typed::<String>("ai_thinking")
+            .unwrap_or_else(|_| "auto".into());
+        let model = self
+            .convars
+            .get_typed::<String>("ai_model")
+            .unwrap_or_default();
+
+        let Some(level) = level else {
+            let mut report = format!(
+                "Reasoning effort: {}  ·  model: {}",
+                if current.trim().is_empty() {
+                    "auto"
+                } else {
+                    current.trim()
+                },
+                if model.is_empty() {
+                    "(none selected)"
+                } else {
+                    &model
+                }
+            );
+            if advertised.is_empty() {
+                report.push_str(
+                    "\nThis model advertises no effort levels; only 'auto' and 'off' apply.",
+                );
+            } else {
+                report.push_str(&format!("\nAdvertised levels: {}", advertised.join(", ")));
+            }
+            if let Some(default) = &default {
+                report.push_str(&format!("  ·  provider default: {default}"));
+            }
+            report.push_str(
+                "\nSet with /effort <level>; 'auto' leaves the choice to the provider, 'off' disables reasoning.",
+            );
+            return self.emit_provider_diagnostic(journal, report);
+        };
+
+        let normalized = level.trim().to_ascii_lowercase();
+        let value: String = match normalized.as_str() {
+            "auto" | "default" => "auto".to_string(),
+            "off" | "none" | "0" | "disabled" | "no" => "off".to_string(),
+            other => {
+                if !advertised
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(other))
+                {
+                    return Err(StructuredError::new(
+                        "unsupported_thinking_level",
+                        format!(
+                            "'{level}' is not a reasoning effort this model advertises; available: {}",
+                            if advertised.is_empty() {
+                                "auto, off".to_string()
+                            } else {
+                                format!("auto, off, {}", advertised.join(", "))
+                            }
+                        ),
+                        false,
+                    ));
+                }
+                // Use the provider's own spelling so the value round-trips.
+                advertised
+                    .iter()
+                    .find(|known| known.eq_ignore_ascii_case(other))
+                    .cloned()
+                    .unwrap_or_else(|| other.to_string())
+            }
+        };
+        let value = value.as_str();
+        // Writing through the command engine keeps journaling and validation
+        // identical to `/ai_thinking <value>`.
+        self.execute_command(journal, &format!("ai_thinking {value}"))?;
+        let mut report = format!("Reasoning effort set to '{value}'");
+        if let Some(default) = &default {
+            report.push_str(&format!(" (provider default: {default})"));
+        }
+        report.push('.');
+        self.emit_provider_diagnostic(journal, report)
+    }
+
     /// Journals one diagnostic element, which is how the console reports state.
     fn emit_provider_diagnostic(
         &mut self,

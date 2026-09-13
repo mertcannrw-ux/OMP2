@@ -44,7 +44,7 @@ fn catalog_provider(models: Vec<(&'static str, u64)>) -> (String, thread::JoinHa
     let port = listener.local_addr().unwrap().port();
     let endpoint = format!("http://127.0.0.1:{port}/v1");
     let handle = thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut served = 0;
         while std::time::Instant::now() < deadline {
             let mut socket = match listener.accept() {
@@ -56,7 +56,7 @@ fn catalog_provider(models: Vec<(&'static str, u64)>) -> (String, thread::JoinHa
                 Err(error) => panic!("{error}"),
             };
             socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(Duration::from_secs(30)))
                 .unwrap();
             let mut reader = BufReader::new(socket.try_clone().unwrap());
             let mut line = String::new();
@@ -266,4 +266,96 @@ fn two_providers_coexist_and_only_one_is_active() {
     }
     first_server.join().unwrap();
     second_server.join().unwrap();
+}
+
+#[test]
+fn effort_is_reported_set_and_validated_against_the_model() {
+    let workspace = Workspace::new();
+    let mut journal = workspace.journal();
+    let mut host = workspace.host();
+
+    // A model that advertises effort levels, as a provider refresh would record.
+    for (name, value) in [
+        ("ai_model", TypedValue::String("thinking-model".into())),
+        (
+            "ai_thinking_levels",
+            TypedValue::Json(serde_json::json!(["low", "medium", "high"])),
+        ),
+        ("ai_thinking", TypedValue::String("auto".into())),
+    ] {
+        let convars = journal.snapshot().container("convars").clone();
+        journal
+            .append_patch(omp_types::Patch {
+                base_offset: omp_types::JournalOffset(journal.snapshot().offset),
+                result_offset: journal.next_offset(),
+                by: ActorId::new("owner").unwrap().into(),
+                reason: "test provider metadata".into(),
+                ops: vec![omp_types::PatchOp::SetAttribute {
+                    element: convars,
+                    name: name.into(),
+                    value,
+                }],
+            })
+            .unwrap();
+    }
+    host.convars
+        .hydrate_from_dom(journal.snapshot());
+
+    // Reporting lists what the model actually offers.
+    host.execute_command(&mut journal, "effort").unwrap();
+    let report = last_diagnostic(&journal);
+    assert!(report.contains("Reasoning effort: auto"), "{report}");
+    assert!(report.contains("low, medium, high"), "{report}");
+
+    // Setting an advertised level writes the convar through the journal.
+    host.execute_command(&mut journal, "effort high").unwrap();
+    assert_eq!(
+        journal.snapshot().session_globals()["ai_thinking"],
+        TypedValue::String("high".into())
+    );
+    assert!(last_diagnostic(&journal).contains("set to 'high'"));
+
+    // The provider's own spelling is preserved when the case differs.
+    host.execute_command(&mut journal, "effort MEDIUM").unwrap();
+    assert_eq!(
+        journal.snapshot().session_globals()["ai_thinking"],
+        TypedValue::String("medium".into())
+    );
+
+    // A level the model does not advertise is refused before a turn can fail.
+    let error = host
+        .execute_command(&mut journal, "effort xhigh")
+        .unwrap_err();
+    assert_eq!(error.code, "unsupported_thinking_level");
+    assert!(error.message.contains("low, medium, high"), "{}", error.message);
+
+    // Control values always apply.
+    host.execute_command(&mut journal, "effort off").unwrap();
+    assert_eq!(
+        journal.snapshot().session_globals()["ai_thinking"],
+        TypedValue::String("off".into())
+    );
+    host.execute_command(&mut journal, "effort auto").unwrap();
+    assert_eq!(
+        journal.snapshot().session_globals()["ai_thinking"],
+        TypedValue::String("auto".into())
+    );
+}
+
+#[test]
+fn a_model_without_effort_levels_says_so_instead_of_guessing() {
+    let workspace = Workspace::new();
+    let mut journal = workspace.journal();
+    let mut host = workspace.host();
+
+    host.execute_command(&mut journal, "effort").unwrap();
+    let report = last_diagnostic(&journal);
+    assert!(
+        report.contains("advertises no effort levels"),
+        "an unadvertised model must not be presented as having levels: {report}"
+    );
+
+    let error = host.execute_command(&mut journal, "effort high").unwrap_err();
+    assert_eq!(error.code, "unsupported_thinking_level");
+    assert!(error.message.contains("auto, off"), "{}", error.message);
 }

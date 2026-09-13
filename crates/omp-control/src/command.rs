@@ -130,6 +130,10 @@ pub enum Command {
         reminder: Option<String>,
         max_attempts: Option<u32>,
     },
+    /// Report or set the reasoning effort for the active model.
+    Effort {
+        level: Option<String>,
+    },
     ToolCall {
         name: String,
         input: serde_json::Value,
@@ -200,6 +204,9 @@ pub enum CommandEffect {
     },
     Provider {
         action: ProviderAction,
+    },
+    Effort {
+        level: Option<String>,
     },
 }
 
@@ -556,6 +563,9 @@ impl CommandParser {
                     job_id: tokens[2].clone(),
                 })
             }
+            "effort" | "/effort" | "reasoning" | "/reasoning" => Ok(Command::Effort {
+                level: tokens.get(1).map(|value| value.trim().to_lowercase()),
+            }),
             "provider" | "/provider" => {
                 let action = match tokens.get(1).map(String::as_str) {
                     None => ProviderAction::Show,
@@ -577,7 +587,7 @@ impl CommandParser {
                             model,
                         }
                     }
-                    Some("--help" | "help") => return Ok(Command::Echo { message: "Usage: /provider [list | add <name> <endpoint> [--adapter <dialect>] [--key-env <ENV>] [--model <id>] | use <name> | remove <name> | refresh | select <id> | <endpoint> [options]]. Providers are recorded in the session, so switching costs no retyping; the model list names the provider each model came from. Default dialect: OpenAI-compatible; key: OMP_API_KEY. Never paste API keys into commands.".into() }),
+                    Some("--help" | "help") => return Ok(Command::Echo { message: "Usage: /provider [list | add <name> <endpoint> [--adapter <dialect>] [--key-env <ENV>] [--model <id>] | use <name> | remove <name> | refresh | select <id> | <endpoint> [options]]. Providers are recorded in the session, so switching costs no retyping; the model list names the provider each model came from. Default dialect: OpenAI-compatible; key: OMP_API_KEY. Never paste API keys into commands. Reasoning effort: /effort <level>.".into() }),
                     Some(endpoint) => {
                         let (adapter, key_env, model) =
                             parse_provider_options(endpoint_default_adapter(endpoint), &tokens[2..])?;
@@ -967,6 +977,7 @@ impl CommandEngine {
             Command::DynDiscovery { query, .. } => Ok(vec![CommandEffect::DynDiscovered { query }]),
             Command::CancelJob { job_id } => Ok(vec![CommandEffect::JobCancelled { job_id }]),
             Command::Provider { action } => Ok(vec![CommandEffect::Provider { action }]),
+            Command::Effort { level } => Ok(vec![CommandEffect::Effort { level }]),
             Command::Custom { name, args } => {
                 // If it looks like convar set:
                 if let Some(_def) = convars.get_def(&name) {

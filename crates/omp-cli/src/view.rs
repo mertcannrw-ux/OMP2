@@ -87,6 +87,43 @@ impl Theme {
     }
 }
 
+/// `  ·  effort <level>` for the status footer.
+///
+/// Shows the active level, or `auto` with the provider's default in
+/// parentheses so "whatever the model would do" is still visible. Models that
+/// advertise no effort levels get no indicator at all.
+fn effort_indicator(snapshot: &SessionSnapshot) -> String {
+    let configured = setting(snapshot, "ai_thinking");
+    let configured = configured.trim();
+    let default = snapshot
+        .element(snapshot.container("capabilities"))
+        .and_then(|node| node.attributes.get("provider_metadata"))
+        .and_then(|value| match value {
+            TypedValue::Json(metadata) => metadata
+                .pointer("/active_model/thinking_default")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            _ => None,
+        });
+    let advertised = matches!(
+        snapshot
+            .element(snapshot.container("convars"))
+            .and_then(|node| node.attributes.get("ai_thinking_levels")),
+        Some(TypedValue::Json(value)) if value.as_array().is_some_and(|levels| !levels.is_empty())
+    );
+    let label = match configured {
+        "" | "auto" => match (default, advertised) {
+            (Some(default), _) => format!("auto ({default})"),
+            (None, true) => "auto".to_string(),
+            // Nothing advertised and nothing asked for: nothing to say.
+            (None, false) => return String::new(),
+        },
+        "off" | "none" | "0" | "disabled" => "off".to_string(),
+        level => level.to_string(),
+    };
+    format!("  ·  effort {label}")
+}
+
 /// ` @ host` for the configured endpoint, so the status line says which
 /// gateway the model came from. Empty when no endpoint is configured.
 fn gateway_suffix(snapshot: &SessionSnapshot) -> String {
@@ -729,14 +766,15 @@ pub fn draw(frame: &mut Frame, state: &mut DrawState, transcript: &mut Transcrip
     frame.render_widget(Paragraph::new(status), layout[4]);
     let context = setting(state.snapshot, "ai_context_length");
     let footer = format!(
-        "{}  ·  {} turns  ·  context {}  ·  /help",
+        "{}  ·  {} turns  ·  context {}{}  ·  /help",
         state.snapshot.current_branch(),
         state.snapshot.turn_count(),
         if context.is_empty() {
             "unknown"
         } else {
             &context
-        }
+        },
+        effort_indicator(state.snapshot)
     );
     frame.render_widget(
         Paragraph::new(safe(&footer)).style(Style::default().fg(theme.muted)),
@@ -796,5 +834,65 @@ mod tests {
         let new_scroll = scroll + added;
         let start_after = new_total - body_height - new_scroll;
         assert_eq!(start_after, start_before);
+    }
+
+    #[test]
+    fn the_footer_says_which_effort_is_in_force() {
+        fn snapshot_with(thinking: &str, levels: serde_json::Value, default: Option<&str>) -> SessionSnapshot {
+            let mut snapshot = SessionSnapshot::empty(omp_types::SessionId::new("test-effort").unwrap());
+            let convars = snapshot.container("convars").clone();
+            let capabilities = snapshot.container("capabilities").clone();
+            let mut patch = |ops| {
+                let base = snapshot.offset;
+                omp_state::apply_patch(
+                    &mut snapshot,
+                    &omp_types::Patch {
+                        base_offset: omp_types::JournalOffset(base),
+                        result_offset: omp_types::JournalOffset(base + 1),
+                        by: omp_types::ActorId::new("test-owner").unwrap().into(),
+                        reason: "test".into(),
+                        ops,
+                    },
+                )
+                .unwrap();
+            };
+            patch(vec![
+                omp_types::PatchOp::SetAttribute {
+                    element: convars.clone(),
+                    name: "ai_thinking".into(),
+                    value: TypedValue::String(thinking.into()),
+                },
+                omp_types::PatchOp::SetAttribute {
+                    element: convars,
+                    name: "ai_thinking_levels".into(),
+                    value: TypedValue::Json(levels),
+                },
+            ]);
+            patch(vec![omp_types::PatchOp::SetAttribute {
+                element: capabilities,
+                name: "provider_metadata".into(),
+                value: TypedValue::Json(serde_json::json!({
+                    "models": [],
+                    "active_model": { "id": "m", "thinking_default": default }
+                })),
+            }]);
+            snapshot
+        }
+
+        // An explicit level is shown as itself.
+        let snapshot = snapshot_with("high", serde_json::json!(["low", "medium", "high"]), Some("medium"));
+        assert_eq!(effort_indicator(&snapshot), "  ·  effort high");
+
+        // "auto" still shows what the provider would do.
+        let snapshot = snapshot_with("auto", serde_json::json!(["low", "medium"]), Some("low"));
+        assert_eq!(effort_indicator(&snapshot), "  ·  effort auto (low)");
+
+        // Reasoning disabled is explicit.
+        let snapshot = snapshot_with("off", serde_json::json!(["low"]), Some("low"));
+        assert_eq!(effort_indicator(&snapshot), "  ·  effort off");
+
+        // A model that advertises nothing gets no indicator rather than a guess.
+        let snapshot = snapshot_with("auto", serde_json::Value::Null, None);
+        assert_eq!(effort_indicator(&snapshot), "");
     }
 }

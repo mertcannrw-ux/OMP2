@@ -559,6 +559,11 @@ impl SessionHost {
         // Provider actions that only edit the registry run here, so a profile or
         // user config can declare providers next to ordinary settings; the ones
         // that reach the network (discovery, selection, switching) run alone.
+        // Effort is configuration that needs the session's advertised levels to
+        // validate against, so it runs here rather than in the convar path.
+        if let Some(CommandEffect::Effort { level }) = effects.first() {
+            return self.execute_effort_command(journal, level.clone());
+        }
         let provider_actions: Vec<ProviderAction> = effects
             .iter()
             .filter_map(|effect| match effect {

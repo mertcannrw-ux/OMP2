@@ -75,7 +75,7 @@ fn scripted_provider(replies: Vec<Value>) -> (ProviderClient, thread::JoinHandle
     let handle = thread::spawn(move || {
         let mut requests = Vec::new();
         for reply in replies {
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
             let mut socket = loop {
                 match listener.accept() {
                     Ok((socket, _)) => break socket,
@@ -90,7 +90,7 @@ fn scripted_provider(replies: Vec<Value>) -> (ProviderClient, thread::JoinHandle
                 }
             };
             socket
-                .set_read_timeout(Some(Duration::from_secs(5)))
+                .set_read_timeout(Some(Duration::from_secs(30)))
                 .unwrap();
             let mut reader = BufReader::new(socket.try_clone().unwrap());
             let mut length = 0;

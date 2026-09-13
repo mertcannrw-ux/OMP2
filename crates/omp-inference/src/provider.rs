@@ -551,13 +551,34 @@ impl ProviderClient {
 
         let mut provenance = None;
         for model in models.iter_mut() {
+            let Some(known) = matched.models.get(&model.id) else {
+                continue;
+            };
+            let mut enriched = false;
             if model.context_length.is_none()
-                && let Some(Some(context_len)) = matched.models.get(&model.id) {
-                    model.context_length = Some(*context_len);
-                    let prov = format!("models.dev:{}", matched.key);
-                    model.context_provenance = Some(prov.clone());
-                    provenance = Some(prov);
-                }
+                && let Some(context_len) = known.context
+            {
+                model.context_length = Some(context_len);
+                enriched = true;
+            }
+            // The registry can describe reasoning for a gateway whose own
+            // catalog carries nothing beyond model ids; advertised is never
+            // overridden, only filled in.
+            if model.thinking_supported.is_none()
+                && let Some(reasoning) = known.reasoning
+            {
+                model.thinking_supported = Some(reasoning);
+                enriched = true;
+            }
+            if model.thinking_levels.is_none() && !known.efforts.is_empty() {
+                model.thinking_levels = Some(known.efforts.clone());
+                enriched = true;
+            }
+            if enriched {
+                let prov = format!("models.dev:{}", matched.key);
+                model.context_provenance = Some(prov.clone());
+                provenance = Some(prov);
+            }
         }
 
         provenance
@@ -1195,16 +1216,38 @@ struct RegistryLimitEntry {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct RegistryReasoningOption {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct RegistryModelEntry {
     #[serde(default)]
     limit: Option<RegistryLimitEntry>,
+    #[serde(default)]
+    reasoning: Option<bool>,
+    #[serde(default)]
+    reasoning_options: Option<Vec<RegistryReasoningOption>>,
+}
+
+/// What the public registry knows about one model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistryModelMetadata {
+    pub context: Option<usize>,
+    /// Whether the model reasons at all.
+    pub reasoning: Option<bool>,
+    /// Effort level names, from the registry's `effort` reasoning option.
+    pub efforts: Vec<String>,
 }
 
 /// Matched provider entry from the public models registry.
 #[derive(Debug, Clone)]
 pub struct MatchedRegistryProvider {
     pub key: String,
-    pub models: HashMap<String, Option<usize>>,
+    pub models: HashMap<String, RegistryModelMetadata>,
 }
 
 struct RegistryLookup<'a> {
@@ -1264,7 +1307,7 @@ struct ProviderFieldVisitor<'a> {
 }
 
 impl<'de, 'a> DeserializeSeed<'de> for ProviderFieldVisitor<'a> {
-    type Value = Option<HashMap<String, Option<usize>>>;
+    type Value = Option<HashMap<String, RegistryModelMetadata>>;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
@@ -1275,7 +1318,7 @@ impl<'de, 'a> DeserializeSeed<'de> for ProviderFieldVisitor<'a> {
 }
 
 impl<'de, 'a> serde::de::Visitor<'de> for ProviderFieldVisitor<'a> {
-    type Value = Option<HashMap<String, Option<usize>>>;
+    type Value = Option<HashMap<String, RegistryModelMetadata>>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         formatter.write_str("a provider object with api and models")
@@ -1286,7 +1329,7 @@ impl<'de, 'a> serde::de::Visitor<'de> for ProviderFieldVisitor<'a> {
         M: serde::de::MapAccess<'de>,
     {
         let mut api_matches = None;
-        let mut parsed_models = None;
+        let mut parsed_models: Option<HashMap<String, RegistryModelEntry>> = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -1321,8 +1364,29 @@ impl<'de, 'a> serde::de::Visitor<'de> for ProviderFieldVisitor<'a> {
             let model_map = parsed_models
                 .unwrap_or_default()
                 .into_iter()
-                .map(|(id, m)| (id, m.limit.and_then(|l| l.context)))
-                .collect();
+                .map(|(id, entry)| {
+                    let efforts = entry
+                        .reasoning_options
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|option| {
+                            option
+                                .kind
+                                .as_deref()
+                                .is_some_and(|kind| kind.eq_ignore_ascii_case("effort"))
+                        })
+                        .flat_map(|option| option.values)
+                        .collect();
+                    (
+                        id,
+                        RegistryModelMetadata {
+                            context: entry.limit.and_then(|limit| limit.context),
+                            reasoning: entry.reasoning,
+                            efforts,
+                        },
+                    )
+                })
+                .collect::<HashMap<String, RegistryModelMetadata>>();
             Ok(Some(model_map))
         } else {
             Ok(None)
@@ -2646,6 +2710,37 @@ mod tests {
     }
 
     #[test]
+    fn registry_supplies_reasoning_levels_the_gateway_omits() {
+        let registry = serde_json::json!({
+            "opencode-go": {
+                "api": "https://opencode.ai/zen/go/v1",
+                "models": {
+                    "glm-5.3-flash": {
+                        "limit": { "context": 1000000 },
+                        "reasoning": true,
+                        "reasoning_options": [
+                            { "type": "effort", "values": ["low", "high", "max"] }
+                        ]
+                    },
+                    "plain-model": { "limit": { "context": 32000 }, "reasoning": false }
+                }
+            }
+        });
+        let bytes = serde_json::to_vec(&registry).unwrap();
+        let matched = parse_registry_for_endpoint(&bytes, "https://opencode.ai/zen/go/v1")
+            .unwrap()
+            .expect("provider matches");
+        let glm = matched.models.get("glm-5.3-flash").unwrap();
+        assert_eq!(glm.context, Some(1_000_000));
+        assert_eq!(glm.reasoning, Some(true));
+        assert_eq!(glm.efforts, vec!["low", "high", "max"]);
+
+        let plain = matched.models.get("plain-model").unwrap();
+        assert_eq!(plain.reasoning, Some(false));
+        assert!(plain.efforts.is_empty(), "no effort options means no levels");
+    }
+
+    #[test]
     fn test_catalog_rejects_malformed_response() {
         // Malformed catalog (no data or models array)
         let malformed = serde_json::json!({ "error": "not found" });
@@ -2975,8 +3070,20 @@ mod tests {
             .unwrap()
             .expect("should match opencode-go");
         assert_eq!(matched_go.key, "opencode-go");
-        assert_eq!(matched_go.models.get("hy3"), Some(&Some(256000)));
-        assert_eq!(matched_go.models.get("other"), Some(&Some(64000)));
+        assert_eq!(
+            matched_go
+                .models
+                .get("hy3")
+                .and_then(|known| known.context),
+            Some(256000)
+        );
+        assert_eq!(
+            matched_go
+                .models
+                .get("other")
+                .and_then(|known| known.context),
+            Some(64000)
+        );
         assert_eq!(matched_go.models.get("gpt-4"), None);
 
         // 2. Exact match for opencode (route isolation)
@@ -2984,7 +3091,13 @@ mod tests {
             .unwrap()
             .expect("should match opencode");
         assert_eq!(matched_zen.key, "opencode");
-        assert_eq!(matched_zen.models.get("hy3"), Some(&Some(128000)));
+        assert_eq!(
+            matched_zen
+                .models
+                .get("hy3")
+                .and_then(|known| known.context),
+            Some(128000)
+        );
 
         // 3. Unmatched route returns None
         let unmatched = parse_registry_for_endpoint(&bytes, "https://unmatched.ai/v1").unwrap();

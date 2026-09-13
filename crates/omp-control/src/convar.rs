@@ -835,7 +835,7 @@ pub fn register_builtin_convars(store: &mut ConVarStore) {
     store.register(ConVar::new(
         "ai_thinking",
         "auto".to_string(),
-        "Desired model thinking/reasoning mode (auto/none/enabled/effort)",
+        "Reasoning effort: 'auto' (provider default), 'off', or a level the model advertises (/effort)",
         session_replicated,
     ));
 

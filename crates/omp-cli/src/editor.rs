@@ -766,6 +766,19 @@ pub fn completions(text: &str, snapshot: &SessionSnapshot) -> Vec<Completion> {
         return Vec::new();
     }
 
+    // "/effort <filter>" offers the levels the active model advertises.
+    if let Some(level_query) = text.strip_prefix("/effort ") {
+        return effort_completions(level_query, snapshot);
+    }
+    if text == "/effort" {
+        return vec![Completion {
+            label: "/effort".into(),
+            description: "Show or set reasoning effort for the active model".into(),
+            insert: "/effort ".into(),
+            execute: true,
+        }];
+    }
+
     // Special context: "/provider select <filter>" offers discovered models exclusively
     if let Some(model_query) = text.strip_prefix("/provider select ") {
         return model_completions(model_query, snapshot);
@@ -874,9 +887,15 @@ fn base_command_roster() -> Vec<Completion> {
             execute: true,
         },
         Completion {
+            label: "/effort".into(),
+            description: "Reasoning effort: show it, or set a level the model advertises".into(),
+            insert: "/effort ".into(),
+            execute: true,
+        },
+        Completion {
             label: "/thinking".into(),
             description:
-                "Toggle reasoning/thinking block visibility in transcript (cl_showthinking)".into(),
+                "Toggle reasoning block *visibility* in the transcript (cl_showthinking); use /effort to change how hard the model thinks".into(),
             insert: "/thinking".into(),
             execute: true,
         },
@@ -925,6 +944,73 @@ fn base_command_roster() -> Vec<Completion> {
             execute: true,
         },
     ]
+}
+
+/// Completion candidates for reasoning effort: the levels the active model
+/// advertises, plus the two control values that always apply.
+fn effort_completions(query: &str, snapshot: &SessionSnapshot) -> Vec<Completion> {
+    let query_lower = query.trim().to_lowercase();
+    let advertised: Vec<String> = match snapshot
+        .element(snapshot.container("convars"))
+        .and_then(|node| node.attributes.get("ai_thinking_levels"))
+    {
+        Some(TypedValue::Json(value)) => value
+            .as_array()
+            .map(|levels| {
+                levels
+                    .iter()
+                    .filter_map(|level| level.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let default = snapshot
+        .element(snapshot.container("capabilities"))
+        .and_then(|node| node.attributes.get("provider_metadata"))
+        .and_then(|value| match value {
+            TypedValue::Json(metadata) => metadata
+                .pointer("/active_model/thinking_default")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            _ => None,
+        });
+    let current = crate::view::setting(snapshot, "ai_thinking");
+
+    let mut entries: Vec<(String, String)> = advertised
+        .iter()
+        .map(|level| {
+            let mut description = format!("Model effort level '{level}'");
+            if default.as_deref() == Some(level.as_str()) {
+                description.push_str(" · provider default");
+            }
+            (level.clone(), description)
+        })
+        .collect();
+    entries.push(("auto".into(), "Leave effort to the provider".into()));
+    entries.push(("off".into(), "Disable reasoning entirely".into()));
+
+    entries
+        .into_iter()
+        .filter(|(level, description)| {
+            query_lower.is_empty()
+                || level.to_lowercase().contains(&query_lower)
+                || description.to_lowercase().contains(&query_lower)
+        })
+        .map(|(level, description)| {
+            let marker = if current.eq_ignore_ascii_case(&level) {
+                " · current"
+            } else {
+                ""
+            };
+            Completion {
+                label: format!("/effort {level}"),
+                description: format!("{description}{marker}"),
+                insert: format!("/effort {level}"),
+                execute: true,
+            }
+        })
+        .collect()
 }
 
 /// Generates completion candidates for advertised models under
@@ -1434,5 +1520,66 @@ mod tests {
         let by_provider = completions("/provider select clawbay", &snapshot);
         assert_eq!(by_provider.len(), 1);
         assert!(by_provider[0].label.contains("claude-fable-5"));
+    }
+
+    #[test]
+    fn effort_completions_list_the_models_levels() {
+        let mut snapshot = SessionSnapshot::empty(SessionId::new("test-effort-list").unwrap());
+        let convars = snapshot.container("convars").clone();
+        let capabilities = snapshot.container("capabilities").clone();
+        let mut set = |element: omp_types::ElementId, name: &str, value: TypedValue| {
+            let base = snapshot.offset;
+            omp_state::apply_patch(
+                &mut snapshot,
+                &omp_types::Patch {
+                    base_offset: omp_types::JournalOffset(base),
+                    result_offset: omp_types::JournalOffset(base + 1),
+                    by: omp_types::ActorId::new("test-owner").unwrap().into(),
+                    reason: "test".into(),
+                    ops: vec![omp_types::PatchOp::SetAttribute {
+                        element,
+                        name: name.into(),
+                        value,
+                    }],
+                },
+            )
+            .unwrap();
+        };
+        set(
+            convars.clone(),
+            "ai_thinking_levels",
+            TypedValue::Json(serde_json::json!(["low", "medium", "high"])),
+        );
+        set(convars, "ai_thinking", TypedValue::String("high".into()));
+        set(
+            capabilities,
+            "provider_metadata",
+            TypedValue::Json(serde_json::json!({
+                "models": [],
+                "active_model": { "id": "m", "thinking_default": "medium" }
+            })),
+        );
+
+        let offered = completions("/effort ", &snapshot);
+        let labels: Vec<&str> = offered.iter().map(|entry| entry.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "/effort low",
+                "/effort medium",
+                "/effort high",
+                "/effort auto",
+                "/effort off"
+            ]
+        );
+        let medium = &offered[1];
+        assert!(medium.description.contains("provider default"), "{}", medium.description);
+        let high = &offered[2];
+        assert!(high.description.contains("current"), "{}", high.description);
+
+        // Filtering narrows to the matching level.
+        let filtered = completions("/effort me", &snapshot);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].label, "/effort medium");
     }
 }
