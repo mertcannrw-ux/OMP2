@@ -1,0 +1,114 @@
+{
+  "scenarios": [
+    {
+      "name": "stringified_json_arguments",
+      "tool_name": "Read",
+      "raw_arguments": "{\"path\": \"crates/omp-render/src/transcript.rs\", \"limit\": 100}",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          }
+        },
+        "required": ["path"]
+      },
+      "expected_outcome": {
+        "arguments": {
+          "path": "crates/omp-render/src/transcript.rs",
+          "limit": 100
+        },
+        "diagnostics": [
+          {
+            "parameter": "root",
+            "original_value": "{\"path\": \"crates/omp-render/src/transcript.rs\", \"limit\": 100}",
+            "repaired_value": "{\"limit\":100,\"path\":\"crates/omp-render/src/transcript.rs\"}",
+            "reason": "parsed stringified JSON arguments into structured object"
+          }
+        ],
+        "modified": true
+      }
+    },
+    {
+      "name": "delimited_string_to_array_repair",
+      "tool_name": "Grep",
+      "raw_arguments": {
+        "pattern": "TranscriptScheduler",
+        "paths": "src/transcript.rs, src/debug.rs, src/terminal.rs"
+      },
+      "schema": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string"
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "expected_outcome": {
+        "arguments": {
+          "pattern": "TranscriptScheduler",
+          "paths": [
+            "src/transcript.rs",
+            "src/debug.rs",
+            "src/terminal.rs"
+          ]
+        },
+        "diagnostics": [
+          {
+            "parameter": "paths",
+            "original_value": "src/transcript.rs, src/debug.rs, src/terminal.rs",
+            "repaired_value": "[\"src/transcript.rs\",\"src/debug.rs\",\"src/terminal.rs\"]",
+            "reason": "parsed delimited string into native string array"
+          }
+        ],
+        "modified": true
+      }
+    },
+    {
+      "name": "leaked_xml_tool_call_tag",
+      "raw_model_output": "I will examine the transcript scheduler source:\n\n<tool_call>\n{\n  \"name\": \"Read\",\n  \"arguments\": {\n    \"path\": \"crates/omp-render/src/transcript.rs\"\n  }\n}\n</tool_call>\n\nPlease inspect the output.",
+      "extracted_calls": [
+        {
+          "name": "Read",
+          "arguments": {
+            "path": "crates/omp-render/src/transcript.rs"
+          }
+        }
+      ]
+    },
+    {
+      "name": "leaked_action_input_format",
+      "raw_model_output": "Thought: I need to list files.\nAction: Bash\nAction Input: {\"command\": \"cargo check --workspace\"}\nObservation:",
+      "extracted_calls": [
+        {
+          "name": "Bash",
+          "arguments": {
+            "command": "cargo check --workspace"
+          }
+        }
+      ]
+    },
+    {
+      "name": "leaked_markdown_json_block",
+      "raw_model_output": "Here is the tool call to update the configuration:\n```json\n{\n  \"name\": \"Write\",\n  \"parameters\": {\n    \"path\": \"configs/settings.json\",\n    \"content\": \"{}\"\n  }\n}\n```",
+      "extracted_calls": [
+        {
+          "name": "Write",
+          "arguments": {
+            "path": "configs/settings.json",
+            "content": "{}"
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+[package]
+name = "omp-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+omp-types = { path = "../omp-types" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+omp-state = { path = "../omp-state" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_AppLocker", "Win32_Security_Authorization", "Win32_Security_Isolation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_FileSystem", "Win32_System_Environment"] }

@@ -1,0 +1,102 @@
+{
+  "scenario": "terminal_geometry_rebuild_replay_gate",
+  "initial_geometry": {
+    "width": 80,
+    "height": 24,
+    "display_epoch": 1
+  },
+  "snapshot_before_resize": {
+    "viewport": [
+      "--- user turn 1 ---",
+      "Inspect the workspace files and review transcript protocol.",
+      "--- tool turn 1: Read ---",
+      "pub struct TranscriptScheduler { ... }"
+    ],
+    "logical_history": [
+      "Inspect the workspace files and review transcript protocol.",
+      "pub struct TranscriptScheduler { ... }"
+    ],
+    "display_epoch": 1,
+    "commit_frontier": 2,
+    "fail_stopped": false
+  },
+  "resize_event": {
+    "target_width": 100,
+    "target_height": 30,
+    "policy": "Rebuild"
+  },
+  "replay_gate_lifecycle": [
+    {
+      "step": 1,
+      "state": {
+        "PreparingReplay": {
+          "epoch": 2,
+          "target_width": 100,
+          "target_height": 30
+        }
+      }
+    },
+    {
+      "step": 2,
+      "state": {
+        "ReplayWriting": {
+          "epoch": 2
+        }
+      }
+    },
+    {
+      "step": 3,
+      "state": "Idle"
+    }
+  ],
+  "snapshot_after_resize": {
+    "viewport": [
+      "--- user turn 1 ---",
+      "Inspect the workspace files and review transcript protocol.",
+      "--- tool turn 1: Read ---",
+      "pub struct TranscriptScheduler { ... }"
+    ],
+    "logical_history": [
+      "Inspect the workspace files and review transcript protocol.",
+      "pub struct TranscriptScheduler { ... }"
+    ],
+    "display_epoch": 2,
+    "commit_frontier": 2,
+    "fail_stopped": false
+  },
+  "logical_history_invariant_preserved": true,
+  "write_failure_scenario": {
+    "accepted_prefix": 2,
+    "forensic_rows": [
+      {
+        "text": "--- user turn 1 ---",
+        "source_block": "b-user-1",
+        "owner": "user",
+        "width": 19,
+        "epoch": 2,
+        "is_summary": false,
+        "source": "FailedWrite"
+      },
+      {
+        "text": "Inspect the workspace files and review transcript protocol.",
+        "source_block": "b-user-1",
+        "owner": "user",
+        "width": 59,
+        "epoch": 2,
+        "is_summary": false,
+        "source": "FailedWrite"
+      }
+    ],
+    "final_replay_gate": {
+      "FailedStop": {
+        "error": {
+          "code": "terminal_write_failure",
+          "message": "broken pipe writing to physical terminal native rows",
+          "retryable": false
+        },
+        "forensic_rows_written": 2
+      }
+    },
+    "fail_stopped": true
+  }
+}

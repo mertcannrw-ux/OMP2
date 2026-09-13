@@ -1,0 +1,468 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:omp2:patch:1",
+  "x-maxBytes": 1048576,
+  "type": "object",
+  "properties": {
+    "base_offset": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "result_offset": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "by": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Actor": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            }
+          },
+          "required": [
+            "Actor"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Element": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$"
+            }
+          },
+          "required": [
+            "Element"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "ops": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "Create": {
+                "type": "object",
+                "properties": {
+                  "parent": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9._-]+$"
+                  },
+                  "index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                  },
+                  "element": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[A-Za-z0-9._-]+$"
+                      },
+                      "schema_version": {
+                        "const": 1
+                      },
+                      "kind": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[A-Za-z0-9_-]+$"
+                      },
+                      "attributes": {
+                        "type": "object",
+                        "additionalProperties": {
+                          "oneOf": [
+                            {
+                              "const": "Null"
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "Bool": {
+                                  "type": "boolean"
+                                }
+                              },
+                              "required": [
+                                "Bool"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "Integer": {
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "Integer"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "Number": {
+                                  "type": "number"
+                                }
+                              },
+                              "required": [
+                                "Number"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "String": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "String"
+                              ],
+                              "additionalProperties": false
+                            },
+                            {
+                              "type": "object",
+                              "properties": {
+                                "Json": {}
+                              },
+                              "required": [
+                                "Json"
+                              ],
+                              "additionalProperties": false
+                            }
+                          ]
+                        }
+                      },
+                      "text": {
+                        "type": "string"
+                      },
+                      "payload": {}
+                    },
+                    "required": [
+                      "id",
+                      "schema_version",
+                      "kind",
+                      "attributes",
+                      "text",
+                      "payload"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "parent",
+                  "index",
+                  "element"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "Create"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Delete": {
+                "type": "object",
+                "properties": {
+                  "element": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9._-]+$"
+                  }
+                },
+                "required": [
+                  "element"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "Delete"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "Move": {
+                "type": "object",
+                "properties": {
+                  "element": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9._-]+$"
+                  },
+                  "parent": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9._-]+$"
+                  },
+                  "index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 4294967295
+                  }
+                },
+                "required": [
+                  "element",
+                  "parent",
+                  "index"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "Move"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "SetAttribute": {
+                "type": "object",
+                "properties": {
+                  "element": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9._-]+$"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "oneOf": [
+                      {
+                        "const": "Null"
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "Bool": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "Bool"
+                        ],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "Integer": {
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "Integer"
+                        ],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "Number": {
+                            "type": "number"
+                          }
+                        },
+                        "required": [
+                          "Number"
+                        ],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "String": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "String"
+                        ],
+                        "additionalProperties": false
+                      },
+                      {
+                        "type": "object",
+                        "properties": {
+                          "Json": {}
+                        },
+                        "required": [
+                          "Json"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "element",
+                  "name",
+                  "value"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "SetAttribute"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "RemoveAttribute": {
+                "type": "object",
+                "properties": {
+                  "element": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9._-]+$"
+                  },
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "element",
+                  "name"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "RemoveAttribute"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "ReplaceText": {
+                "type": "object",
+                "properties": {
+                  "element": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9._-]+$"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "element",
+                  "text"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "ReplaceText"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "AppendText": {
+                "type": "object",
+                "properties": {
+                  "element": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9._-]+$"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "element",
+                  "text"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "AppendText"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "ReplacePayload": {
+                "type": "object",
+                "properties": {
+                  "element": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9._-]+$"
+                  },
+                  "payload": {}
+                },
+                "required": [
+                  "element",
+                  "payload"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "ReplacePayload"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    }
+  },
+  "required": [
+    "base_offset",
+    "result_offset",
+    "by",
+    "reason",
+    "ops"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,16 @@
+[package]
+name = "omp-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+omp-types = { path = "../omp-types" }
+omp-state = { path = "../omp-state" }
+omp-control = { path = "../omp-control" }
+omp-render = { path = "../omp-render" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }

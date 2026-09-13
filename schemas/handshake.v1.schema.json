@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:omp2:handshake:1",
+  "x-maxBytes": 1048576,
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "object",
+      "properties": {
+        "major": {
+          "const": 1
+        },
+        "minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ],
+      "additionalProperties": false
+    },
+    "features": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 128,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9._@-]+$"
+      }
+    },
+    "required_features": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 128,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9._@-]+$"
+      }
+    }
+  },
+  "required": [
+    "version",
+    "features",
+    "required_features"
+  ],
+  "additionalProperties": false
+}

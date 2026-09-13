@@ -1,0 +1,91 @@
+[
+  {
+    "base_offset": 0,
+    "result_offset": 1,
+    "by": {
+      "Actor": "act-01h8abc123456789"
+    },
+    "reason": "initialize user prompt element in body",
+    "ops": [
+      {
+        "Create": {
+          "parent": "body",
+          "index": 0,
+          "element": {
+            "id": "elem-user-turn-1",
+            "schema_version": 1,
+            "kind": "user",
+            "attributes": {
+              "author": {
+                "String": "user"
+              }
+            },
+            "text": "Inspect the workspace files and review transcript protocol.",
+            "payload": null
+          }
+        }
+      }
+    ]
+  },
+  {
+    "base_offset": 1,
+    "result_offset": 2,
+    "by": {
+      "Actor": "act-01h8abc123456789"
+    },
+    "reason": "create tool invocation for Read",
+    "ops": [
+      {
+        "Create": {
+          "parent": "body",
+          "index": 1,
+          "element": {
+            "id": "elem-tool-read-1",
+            "schema_version": 1,
+            "kind": "tool",
+            "attributes": {
+              "tool_name": {
+                "String": "Read"
+              },
+              "status": {
+                "String": "running"
+              },
+              "intent": {
+                "String": "Reading transcript protocol implementation"
+              }
+            },
+            "text": "",
+            "payload": {
+              "path": "crates/omp-render/src/transcript.rs"
+            }
+          }
+        }
+      }
+    ]
+  },
+  {
+    "base_offset": 2,
+    "result_offset": 3,
+    "by": {
+      "Actor": "act-01h8abc123456789"
+    },
+    "reason": "append tool result and finalize tool status",
+    "ops": [
+      {
+        "AppendText": {
+          "element": "elem-tool-read-1",
+          "text": "1: pub struct TranscriptScheduler { ... }\n"
+        }
+      },
+      {
+        "SetAttribute": {
+          "element": "elem-tool-read-1",
+          "name": "status",
+          "value": {
+            "String": "completed"
+          }
+        }
+      }
+    ]
+  }
+]

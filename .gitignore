@@ -1,0 +1,7 @@
+/target/
+__pycache__/
+*.pyc
+.omp/
+.zcode/
+.pytest_cache/
+/spec/states/

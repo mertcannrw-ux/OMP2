@@ -1,0 +1,160 @@
+{
+  "description": "Counterexample traces and invariant violation fixtures for ElasticSlots transcript protocol",
+  "counterexamples": [
+    {
+      "id": "CE-01",
+      "name": "out_of_order_retirement",
+      "description": "Retiring a block out of sequence violates FIFO commit order and corrupts logical history",
+      "initial_state": {
+        "commit_frontier": 0,
+        "blocks": [
+          { "id": "b1", "state": "Active", "mode": "Mutable", "snapshot": ["turn 1"] },
+          { "id": "b2", "state": "Finalized", "mode": "AppendOnly", "snapshot": ["turn 2"] }
+        ]
+      },
+      "invalid_action": {
+        "action": "RetireBlock",
+        "target_block": "b2"
+      },
+      "violated_invariants": [
+        "ExactCommittedHistory",
+        "LifecycleShape"
+      ],
+      "expected_rejection": {
+        "error_type": "OutOfOrderRetirement",
+        "reason": "block b2 cannot retire before head block b1 commits"
+      }
+    },
+    {
+      "id": "CE-02",
+      "name": "mutable_speculative_leakage",
+      "description": "Active mutable block streaming interim snapshot into logical history before finalization",
+      "initial_state": {
+        "commit_frontier": 0,
+        "blocks": [
+          { "id": "b1", "state": "Active", "mode": "Mutable", "snapshot": ["draft output"] }
+        ]
+      },
+      "invalid_action": {
+        "action": "StreamStablePrefix",
+        "target_block": "b1",
+        "count": 1
+      },
+      "violated_invariants": [
+        "NoPrematureHistory",
+        "EmissionDiscipline"
+      ],
+      "expected_rejection": {
+        "error_type": "MutableBlockCannotStream",
+        "reason": "mutable blocks emit zero rows to logical history while running"
+      }
+    },
+    {
+      "id": "CE-03",
+      "name": "append_only_non_monotonic_mutation",
+      "description": "Append-only block updating snapshot with modified prefix or shrinking content",
+      "initial_state": {
+        "commit_frontier": 0,
+        "blocks": [
+          { "id": "b1", "state": "Active", "mode": "AppendOnly", "snapshot": ["stable row 1", "stable row 2"] }
+        ]
+      },
+      "invalid_action": {
+        "action": "UpdateSnapshot",
+        "target_block": "b1",
+        "new_snapshot": ["stable row 1 modified"]
+      },
+      "violated_invariants": [
+        "AppendOnlyMonotonicity"
+      ],
+      "expected_rejection": {
+        "error_type": "PrefixMonotonicityViolated",
+        "reason": "append-only snapshots must be prefix-monotone extensions of prior snapshots"
+      }
+    },
+    {
+      "id": "CE-04",
+      "name": "duplicate_native_rows_on_retire_after_streaming",
+      "description": "Retiring a partially streamed block by re-emitting full snapshot duplicates rows in scrollback",
+      "initial_state": {
+        "commit_frontier": 0,
+        "blocks": [
+          { "id": "b1", "state": "Finalized", "mode": "AppendOnly", "snapshot": ["row 1", "row 2"], "emitted_prefix": 1 }
+        ],
+        "native_scrollback": [
+          { "text": "row 1", "source": "Append", "epoch": 1 }
+        ]
+      },
+      "invalid_action": {
+        "action": "RetireFullSnapshot",
+        "flaw": "appending full snapshot ['row 1', 'row 2'] to scrollback produces duplicate 'row 1'"
+      },
+      "violated_invariants": [
+        "NativeSourceSafety",
+        "ExactCommittedHistory"
+      ],
+      "correct_behavior": {
+        "action": "RetireUnstreamedSuffixOnly",
+        "appended_to_scrollback": [
+          { "text": "row 2", "source": "Retire", "epoch": 1 }
+        ],
+        "resulting_scrollback_count": 2
+      }
+    },
+    {
+      "id": "CE-05",
+      "name": "rebuild_resize_without_epoch_increment",
+      "description": "Rebuild resize failing to increment display epoch allows stale native row collisions",
+      "initial_state": {
+        "display_epoch": 1,
+        "geometry": { "width": 80, "height": 24 },
+        "native_viewport": [
+          { "text": "rendered at 80 cols", "epoch": 1 }
+        ]
+      },
+      "invalid_action": {
+        "action": "RebuildWithoutEpochBump",
+        "flaw": "viewport rendered at 120 cols without incrementing epoch from 1"
+      },
+      "violated_invariants": [
+        "NativeEpochDiscipline"
+      ],
+      "correct_behavior": {
+        "action": "RebuildWithEpochBump",
+        "new_epoch": 2,
+        "viewport_cleared": true,
+        "replayed_rows_epoch": 2
+      }
+    },
+    {
+      "id": "CE-06",
+      "name": "blind_retry_after_partial_write_failure",
+      "description": "Retrying full write batch after partial terminal I/O failure duplicates already accepted rows",
+      "initial_state": {
+        "pending_viewport": [
+          { "text": "row 1", "epoch": 1 },
+          { "text": "row 2", "epoch": 1 }
+        ],
+        "fail_after_n_writes": 1
+      },
+      "invalid_action": {
+        "action": "BlindRetryEntireBatch",
+        "flaw": "re-sending row 1 duplicates row 1 on physical terminal"
+      },
+      "violated_invariants": [
+        "FailedWriteStops",
+        "ExactCommittedHistory"
+      ],
+      "correct_behavior": {
+        "action": "FailStopAcceptedPrefixForensics",
+        "accepted_prefix_preserved": 1,
+        "forensic_log": [
+          { "text": "row 1", "epoch": 1 }
+        ],
+        "viewport_cleared": true,
+        "fail_stopped": true,
+        "scheduler_halts": true
+      }
+    }
+  ]
+}

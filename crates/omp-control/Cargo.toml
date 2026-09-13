@@ -1,0 +1,14 @@
+[package]
+name = "omp-control"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+omp-types = { path = "../omp-types" }
+omp-state = { path = "../omp-state" }
+omp-inference = { path = "../omp-inference" }
+omp-tools = { path = "../omp-tools" }
+omp-runtime = { path = "../omp-runtime" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

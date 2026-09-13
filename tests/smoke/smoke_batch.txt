@@ -1,0 +1,9 @@
+# Batch-neutral command sequence for testing all seven omp2 subcommands
+run --session-id batch-sess-1 --message "Batch step 1: initialize" --profile default --json
+resume --json
+fork --offset 1 --json
+inspect --format json
+inspect --format xml
+doctor --json
+replay --json
+serve --transport unix --json

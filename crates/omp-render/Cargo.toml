@@ -1,0 +1,11 @@
+[package]
+name = "omp-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+omp-types = { path = "../omp-types" }
+omp-state = { path = "../omp-state" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

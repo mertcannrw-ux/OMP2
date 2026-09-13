@@ -1,0 +1,188 @@
+{
+  "scenario": "branch_fork_and_rewind_restoration",
+  "session_id": "sess-branch-rewind-001",
+  "base_branch": "main",
+  "history": [
+    {
+      "offset": 1,
+      "parent_offset": 0,
+      "branch_id": "main",
+      "action": "user_message",
+      "patch": {
+        "base_offset": 0,
+        "result_offset": 1,
+        "by": {
+          "Actor": "act-user-01"
+        },
+        "reason": "user turn one",
+        "ops": [
+          {
+            "Create": {
+              "parent": "body",
+              "index": 0,
+              "element": {
+                "id": "elem-msg-1",
+                "schema_version": 1,
+                "kind": "user",
+                "attributes": {},
+                "text": "turn one",
+                "payload": null
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "offset": 2,
+      "parent_offset": 1,
+      "branch_id": "main",
+      "action": "checkpoint",
+      "patch": {
+        "base_offset": 1,
+        "result_offset": 2,
+        "by": {
+          "Actor": "act-host-01"
+        },
+        "reason": "record checkpoint",
+        "ops": [
+          {
+            "Create": {
+              "parent": "meta",
+              "index": 0,
+              "element": {
+                "id": "elem-checkpoint-1",
+                "schema_version": 1,
+                "kind": "checkpoint",
+                "attributes": {
+                  "git_ref": {
+                    "String": "refs/heads/main@1a2b3c"
+                  }
+                },
+                "text": "clean git ref",
+                "payload": null
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "offset": 3,
+      "parent_offset": 2,
+      "branch_id": "main",
+      "action": "discover_dynamic_tool",
+      "patch": {
+        "base_offset": 2,
+        "result_offset": 3,
+        "by": {
+          "Actor": "act-host-01"
+        },
+        "reason": "register dynamic tool Calculator",
+        "ops": [
+          {
+            "Create": {
+              "parent": "tools",
+              "index": 0,
+              "element": {
+                "id": "elem-dyn-tool-calc",
+                "schema_version": 1,
+                "kind": "dynamic_tool",
+                "attributes": {
+                  "name": {
+                    "String": "Calculator"
+                  },
+                  "namespace": {
+                    "String": "math"
+                  }
+                },
+                "text": "Calculator dyn tool",
+                "payload": null
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "offset": 4,
+      "parent_offset": 3,
+      "branch_id": "main",
+      "action": "enable_plan_director",
+      "patch": {
+        "base_offset": 3,
+        "result_offset": 4,
+        "by": {
+          "Actor": "act-host-01"
+        },
+        "reason": "push plan director",
+        "ops": [
+          {
+            "Create": {
+              "parent": "directors",
+              "index": 0,
+              "element": {
+                "id": "elem-director-plan",
+                "schema_version": 1,
+                "kind": "plan",
+                "attributes": {
+                  "priority": {
+                    "Integer": 100
+                  }
+                },
+                "text": "must produce plan before yield",
+                "payload": null
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "offset": 5,
+      "parent_offset": 4,
+      "branch_id": "main",
+      "action": "user_message_two",
+      "patch": {
+        "base_offset": 4,
+        "result_offset": 5,
+        "by": {
+          "Actor": "act-user-01"
+        },
+        "reason": "user turn two",
+        "ops": [
+          {
+            "Create": {
+              "parent": "body",
+              "index": 1,
+              "element": {
+                "id": "elem-msg-2",
+                "schema_version": 1,
+                "kind": "user",
+                "attributes": {},
+                "text": "turn two",
+                "payload": null
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "fork": {
+    "fork_at_offset": 2,
+    "new_branch_id": "feature-investigation",
+    "expected_state": {
+      "turn_count": 1,
+      "last_visible_message": "turn one",
+      "has_checkpoint": true,
+      "has_dynamic_tool": false,
+      "has_plan_director": false
+    }
+  },
+  "rewind": {
+    "rewind_to_offset": 2,
+    "expected_active_roster": [],
+    "expected_active_directors": []
+  }
+}

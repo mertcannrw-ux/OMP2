@@ -1,0 +1,96 @@
+{
+  "command_sequences": [
+    {
+      "input": "ai_model claude-3-5-sonnet",
+      "command": {
+        "SetConVar": {
+          "name": "ai_model",
+          "value": "claude-3-5-sonnet"
+        }
+      },
+      "effect": {
+        "ConVarUpdated": {
+          "name": "ai_model",
+          "old_value": {
+            "String": "gpt-4o"
+          },
+          "new_value": {
+            "String": "claude-3-5-sonnet"
+          },
+          "flags": {
+            "bits": 3
+          }
+        }
+      }
+    },
+    {
+      "input": "bind ctrl+t \"toggle cl_showthinking 0 1\"",
+      "command": {
+        "Bind": {
+          "key": "ctrl+t",
+          "command": "toggle cl_showthinking 0 1"
+        }
+      },
+      "effect": {
+        "Bound": {
+          "key": "ctrl+t",
+          "command": "toggle cl_showthinking 0 1"
+        }
+      }
+    },
+    {
+      "input": "toggle cl_showthinking 0 1",
+      "command": {
+        "Toggle": {
+          "name": "cl_showthinking",
+          "values": [
+            "0",
+            "1"
+          ]
+        }
+      },
+      "effect": {
+        "ConVarUpdated": {
+          "name": "cl_showthinking",
+          "old_value": {
+            "Bool": true
+          },
+          "new_value": {
+            "Bool": false
+          },
+          "flags": {
+            "bits": 1
+          }
+        }
+      }
+    },
+    {
+      "input": "alias +thinkhud \"cl_showthinking 1\"",
+      "command": {
+        "Alias": {
+          "name": "+thinkhud",
+          "command": "cl_showthinking 1"
+        }
+      },
+      "effect": {
+        "Aliased": {
+          "name": "+thinkhud",
+          "command": "cl_showthinking 1"
+        }
+      }
+    },
+    {
+      "input": "exec configs/profiles/fastmode.cfg",
+      "command": {
+        "Exec": {
+          "path": "configs/profiles/fastmode.cfg"
+        }
+      },
+      "effect": {
+        "ExecRequested": {
+          "path": "configs/profiles/fastmode.cfg"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,90 @@
+{
+  "rules": [
+    {
+      "id": "anthropic-claude-exact-revision",
+      "host": "api.anthropic.com",
+      "provider": "anthropic",
+      "family": "Claude",
+      "revision": {
+        "Exact": "claude-3-5-sonnet-20241022"
+      },
+      "class": "Flagship",
+      "specificity_level": 5,
+      "priority": 20,
+      "native_tool_cost": "Free",
+      "capabilities": {
+        "Streaming": "Supported",
+        "NativeToolChoice": "Supported",
+        "TokenCount": "Supported",
+        "DeveloperRole": "Unsupported",
+        "MidSessionSystemPrompts": "Unsupported",
+        "RemoteCompaction": "Supported",
+        "UsageQuery": "Supported",
+        "ConstrainedSampling": "Supported"
+      }
+    },
+    {
+      "id": "openai-gpt-family",
+      "host": "api.openai.com",
+      "provider": "openai",
+      "family": "Gpt",
+      "revision": null,
+      "class": "Flagship",
+      "specificity_level": 4,
+      "priority": 10,
+      "native_tool_cost": "Costly",
+      "capabilities": {
+        "Streaming": "Supported",
+        "NativeToolChoice": "Supported",
+        "TokenCount": "Supported",
+        "DeveloperRole": "Supported",
+        "MidSessionSystemPrompts": "Supported",
+        "RemoteCompaction": "Unsupported",
+        "UsageQuery": "Supported",
+        "ConstrainedSampling": "Supported"
+      }
+    },
+    {
+      "id": "class-reasoning-default",
+      "host": null,
+      "provider": null,
+      "family": null,
+      "revision": null,
+      "class": "Reasoning",
+      "specificity_level": 1,
+      "priority": 1,
+      "native_tool_cost": "Unknown",
+      "capabilities": {
+        "Streaming": "Supported",
+        "NativeToolChoice": "Unsupported",
+        "TokenCount": "Unknown",
+        "DeveloperRole": "Unsupported",
+        "MidSessionSystemPrompts": "Unsupported",
+        "RemoteCompaction": "Unsupported",
+        "UsageQuery": "Supported",
+        "ConstrainedSampling": "Unsupported"
+      }
+    },
+    {
+      "id": "class-fast-default",
+      "host": null,
+      "provider": null,
+      "family": null,
+      "revision": null,
+      "class": "Fast",
+      "specificity_level": 1,
+      "priority": 1,
+      "native_tool_cost": "Free",
+      "capabilities": {
+        "Streaming": "Supported",
+        "NativeToolChoice": "Supported",
+        "TokenCount": "Supported",
+        "DeveloperRole": "Supported",
+        "MidSessionSystemPrompts": "Supported",
+        "RemoteCompaction": "Supported",
+        "UsageQuery": "Supported",
+        "ConstrainedSampling": "Supported"
+      }
+    }
+  ]
+}

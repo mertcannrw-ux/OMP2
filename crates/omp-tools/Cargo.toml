@@ -1,0 +1,21 @@
+[package]
+name = "omp-tools"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+omp-types = { path = "../omp-types" }
+omp-state = { path = "../omp-state" }
+omp-runtime = { path = "../omp-runtime" }
+omp-python = { path = "../omp-python" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+parking_lot = "=0.12.5"
+sha2 = "=0.10.9"
+hex = "=0.4.3"
+ureq = { version = "=2.12.1", default-features = false, features = ["tls", "json"] }
+pdf-extract = "=0.9.0"
+html2text = "=0.12.6"
+image = { version = "=0.25.9", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+resvg = { version = "=0.45.1", default-features = false, features = ["text", "system-fonts", "raster-images"] }

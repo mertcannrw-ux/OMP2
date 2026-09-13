@@ -1,0 +1,124 @@
+# ElasticSlots Specification and Model Reference
+
+This directory contains the formal TLA+ specification for the `omp2` ElasticSlots transcript protocol (`spec/ElasticSlots.tla`) based on the Playbook Appendix B specification.
+
+ElasticSlots strictly decouples three architectural layers:
+1. **Semantic State (Layer 1)**: Block lifecycle (`Absent -> Queued -> Active -> Finalized -> Committed`), immutable presentation contracts (`Mutable` vs `AppendOnly`), speculation (`want`), frozen finals (`final`), elastic height reservations with the 2-row shrink bridge (`alloc`, `target`), and atomic updates.
+2. **Logical History Ledger (Layer 2)**: Width-independent, exactly-once committed ledger $L = F_1 \dots F_c + W_{c+1}[1..e_{c+1}]$ where $c$ is the commit frontier and $e_{c+1}$ is the stable emitted prefix of the active append-only head block. Active mutable blocks emit **zero** rows into logical history.
+3. **Physical Terminal (Layer 3)**: Native viewport $V$ of height $H$, append-only native scrollback $S$, display epochs, replay gate protocol (`Idle -> PreparingReplay -> ReplayWriting`), and fail-stop physical write failure handling with forensic accepted-prefix logging.
+
+---
+
+## 1. Constants & Configuration
+
+The model is finite and executable under TLC without unbounded quantifiers or unbounded state growth:
+
+| Constant | Description | Default Model Value in `ElasticSlots.cfg` |
+|---|---|---|
+| `N` | Finite number of block identities ($1..N$ in commit order) | `2` |
+| `H` | Maximum terminal viewport height in character rows | `3` |
+| `MaxResizes` | Bound on resize events (bounds epochs to $0..\text{MaxResizes}$) | `1` |
+| `MaxLive` | Uncommitted-block count threshold that constitutes pressure | `2` |
+| `RowValues` | Finite alphabet of semantic text rows | `{"row-a", "row-b"}` |
+| `SnapshotValues` | Finite universe of block contents | `{<<>>, <<"row-a">>, <<"row-a", "row-b">>}` |
+| `NoFinal` | Model sentinel for blocks without a frozen final snapshot | `NoFinal` (model value) |
+| `Placeholder` | Synthetic viewport row for an empty active slot | `Placeholder` (model value) |
+| `Blank` | Synthetic viewport row for unused screen space | `Blank` (model value) |
+| `OverflowMarker` | Synthetic viewport row summarizing hidden older blocks | `OverflowMarker` (model value) |
+
+---
+
+## 2. Invariants and Formal Properties
+
+The specification verifies eleven state invariants and nine temporal (action and liveness) properties:
+
+### State Invariants (checked in every reachable state)
+
+1. **`TypeOK`**: All variables (`c`, `phase`, `mode`, `want`, `final`, `emitted`, `alloc`, `target`, `history`, `native`, `width`, `height`, `resizes`, `epoch`, `replayMode`, `replayCursor`, `replayEnd`, `replayPartial`, `replayPrepared`, `replayCut`, `flush`, `shutdown`, `running`, `stopReason`) stay within their declared finite domains.
+2. **`LifecycleShape`**: Blocks strictly partition into three monotonic bands:
+   - Committed ($1..c$): all `phase = "Committed"` with declared mode.
+   - Live ($(c+1)..\text{CreatedCount}$): `phase \in {"Queued", "Active", "Finalized"}` with declared mode.
+   - Uncreated ($(\text{CreatedCount}+1)..N$): `phase = "Absent"`, `mode = "Undeclared"`.
+3. **`SnapshotDiscipline`**: Final snapshots exist if and only if a block is `Finalized` or `Committed`, at which point `final[i] = want[i]`; all other blocks hold `NoFinal`.
+4. **`EmissionDiscipline`**: Streaming into logical history is head-only ($i = c + 1$), append-only ($mode = "AppendOnly"`), live ($phase \in {"Active", "Finalized"}$), and bounded by $Len(want[i])$. Mutable blocks never stream while running.
+5. **`Capacity`**: Painted and requested slot allocations satisfy the reservation invariant at all times: $\text{ReservationTotal} + \text{SummaryRows} \le H$.
+6. **`ExactCommittedHistory`**: The central ledger equation:
+   $$\text{history} = \text{CommittedRows}(c, \text{final}) \circ \text{PartialHeadRows}$$
+   Every committed block snapshot is recorded exactly once in block order, followed by the head's stable streamed prefix. No duplicates, no gaps, no out-of-order retirement.
+7. **`NoPrematureHistory`**: Every row in `history` belongs to a committed block ($1..c$) or the active streaming append-only head ($c + 1$). Unfinalized mutable speculation never leaks into history.
+8. **`ScreenCapacity`**: The rendered terminal viewport is exactly $H$ rows, partitioned into blank filler, an optional overflow summary row, and the visible block slots.
+9. **`ReplayShape`**: Replay window is strictly bounded to committed blocks $1..c$, the sampled replay cut matches the required cut, and the tail fits the available blank space.
+10. **`NativeSourceSafety`**: Provenance tags on physical rows (`Append`, `Retire`, `Replay`, `Resize`, `FailedWrite`, `Exit`) never lie:
+    - `Retire` rows originate only from blocks in `Committed` state.
+    - `Append` / `Replay` rows originate only from committed blocks or the append-only head.
+    - `FailedWrite` rows occur only after entering `stopReason = "WriteFailure"`.
+    - `Exit` rows occur only after host termination.
+11. **`FailedWriteStops`**: Fail-stop safety: if `stopReason = "WriteFailure"`, `running = FALSE`.
+
+### Temporal and Liveness Properties
+
+1. **`HistoryMonotonicity`**: `[][HistoryExtension]_vars` — the logical ledger is prefix-monotone across every step and is never rewritten or truncated.
+2. **`NativeEpochDiscipline`**: `[][NativeEpochStep]_vars` — native scrollback either extends monotonically or is wiped if and only if `epoch` increments during a `Rebuild` resize.
+3. **`FinalImmutability`**: `[][FinalsStayFixed]_vars` — once frozen at finalization, a block's final snapshot never changes.
+4. **`AppendOnlyMonotonicity`**: `[][AppendOnlyPrefixStep]_vars` — append-only blocks only extend their content (`Prefix(want, want')`), never mutating or deleting prior lines.
+5. **`ResizeKeepsLogicalHistory`**: `[][ResizeKeepsLogicalHistoryStep]_vars` — terminal geometry changes modify presentation geometry only; `history`, `c`, `mode`, `want`, and `final` are strictly invariant under resize.
+6. **`StoppedQuiescence`**: `[][StoppedStep]_vars` — once stopped (`~running`), the system stutters and accepts no further state mutations.
+7. **`FlushLiveness`**: `(AllFinalized /\ flush /\ shutdown /\ running /\ ~Replaying) ~> (AllCommitted \/ ~running)` — under weak fairness, a shutdown flush drains all finalized blocks to committed status.
+8. **`ReplayLiveness`**: `(Replaying /\ running) ~> (~Replaying \/ ~running)` — any pending replay completes or cleanly halts on write failure.
+9. **`QueuedPressureRetirement`**: Head blocks under pressure and queued demand eventually retire to free space.
+
+---
+
+## 3. Implementation Trace Mapping (TLA+ to Rust)
+
+The Rust implementation in `crates/omp-render/src/transcript.rs` and `crates/omp-render/src/terminal.rs` maps directly to the formal specification:
+
+| TLA+ Specification Construct | Rust Implementation Construct | Operational Contract |
+|---|---|---|
+| `c` (commit frontier) | `TranscriptScheduler.commit_frontier()` | Count of committed blocks ($1..c$); enforces strict FIFO retirement |
+| `phase[i]` | `TranscriptBlock.state` | `Queued -> Active -> Finalized -> Committed` |
+| `mode[i]` | `TranscriptBlock.mode` | `BlockMode::Mutable` vs `BlockMode::AppendOnly` (fixed at admission) |
+| `want[i]` | `TranscriptBlock.snapshot` | Speculative snapshot lines |
+| `final[i]` | `LogicalHistory.committed_blocks[i]` | Frozen snapshot upon `finalize_block()` / `retire_block()` |
+| `emitted[i]` | `TranscriptBlock.emitted_prefix` | Number of stable lines streamed to history/native for head block |
+| `alloc[i]`, `target[i]` | `TranscriptBlock.last_rendered_height`, `reserved_rows` | Elastic height with 2-row shrink bridge (`BridgeHeight`) |
+| `history` | `LogicalHistory.all_lines(active_head)` | Ledger $L = F_1 \dots F_c + W_{c+1}[1..e_{c+1}]$ |
+| `native` | `TranscriptScheduler.native_scrollback` | `Vec<NativeRow>` with `NativeSource` provenance tags |
+| `Screen` | `TranscriptScheduler.native_viewport` | Active rendered frame bounded by `viewport_height` |
+| `display_epoch` | `TranscriptScheduler.display_epoch` | Incremented on `ResizePolicy::Rebuild` to invalidate stale native rows |
+| `replayMode`, `replayPrepared`, `replayCut` | `TranscriptScheduler.replay_gate` | Two-phase replay state machine (`Idle`, `PreparingReplay`, `ReplayWriting`) |
+| `running`, `stopReason` | `TranscriptScheduler.fail_stopped`, `forensic_log` | Halts mutations on write failure; preserves accepted prefix in `forensic_log` |
+| `Create(declaration)` | `admit_block(id, mode, owner)` | Registers block in `Queued` state with immutable mode |
+| `Admit(i)` | `activate_block(id)` | Transitions `Queued -> Active` and allocates initial row |
+| `Update(i, snapshot)` | `update_snapshot(id, lines)` | Updates speculation; enforces prefix-monotonicity on AppendOnly |
+| `BridgeHeight(a, t)` | `apply_elastic_reservation(id)` | 2-row step-down bridge for deep shrinks (`old > new + 2 => old - 2`) |
+| `AppendStable` | `stream_stable_prefix(id, count)` | Appends newly streamed rows to `native_scrollback` with `NativeSource::Append` |
+| `RetireSuccess(batchEnd)` | `retire_block(id)` / `flush()` | Appends unstreamed suffix with `NativeSource::Retire`; commits to `LogicalHistory` |
+| `RetireFailure` / `ReplayFailure` | `handle_write_failure(err, accepted_prefix)` | Drains accepted prefix into `forensic_log`, halts scheduler (`fail_stopped = true`) |
+| `Resize(..., Rebuild)` | `prepare_rebuild_replay()` + `execute_rebuild_replay()` | Two-phase gated replay; increments epoch, clears viewport, replays history |
+
+---
+
+## 4. Running the Model Checker
+
+To execute the model checker against the finite configuration:
+
+```bash
+# Complete check including temporal action and liveness properties:
+tlc spec/ElasticSlots.tla -config spec/ElasticSlots.cfg
+
+# Safety-only check (state invariants):
+tlc spec/ElasticSlots.tla -config spec/ElasticSlots_safety.cfg
+```
+
+---
+
+## 5. Counterexample Fixtures
+
+Counterexample traces and invariant violation scenarios are documented in `tests/fixtures/transcript_counterexamples.json`:
+- **CE-01**: `out_of_order_retirement` — retiring a block before earlier blocks in commit frontier commit.
+- **CE-02**: `mutable_speculative_leakage` — attempting to stream interim mutable lines into logical history.
+- **CE-03**: `append_only_non_monotonic_mutation` — shrinking or modifying existing append-only prefix lines.
+- **CE-04**: `duplicate_native_rows_on_retire_after_streaming` — re-emitting previously streamed prefix rows on block retirement.
+- **CE-05**: `rebuild_resize_without_epoch_increment` — omitting epoch bump during rebuild resize causing row collisions.
+- **CE-06**: `blind_retry_after_partial_write_failure` — retrying a full write batch after partial failure causing duplicated rows on terminal.

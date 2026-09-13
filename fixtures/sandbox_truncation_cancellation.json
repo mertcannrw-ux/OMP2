@@ -1,0 +1,123 @@
+{
+  "request": {
+    "request_id": "req-sandbox-eval-001",
+    "job_id": "job-sandbox-789",
+    "operation_name": "eval",
+    "capabilities": [
+      {
+        "Read": {
+          "root": "."
+        }
+      },
+      {
+        "Execute": {
+          "command": "python"
+        }
+      },
+      {
+        "EnvAccess": {
+          "keys": [
+            "PYTHONUNBUFFERED"
+          ]
+        }
+      }
+    ],
+    "workspace_view_id": "view-isolated-001",
+    "input_artifacts": [],
+    "limits": {
+      "max_bytes": 1048576,
+      "max_lines": 50000,
+      "max_events": 10000,
+      "max_memory_bytes": 268435456,
+      "max_wall_time": {
+        "secs": 120,
+        "nanos": 0
+      },
+      "max_cpu_time": null,
+      "max_child_processes": 16,
+      "max_artifact_bytes": 52428800,
+      "max_concurrent_jobs": 8,
+      "cancel_grace_period": {
+        "secs": 5,
+        "nanos": 0
+      }
+    },
+    "protocol_version": {
+      "major": 1,
+      "minor": 0
+    },
+    "env": {
+      "PYTHONUNBUFFERED": "1"
+    },
+    "args": [
+      "-c",
+      "import sys\nfor i in range(200000):\n    sys.stdout.write(f'line {i}: payload block data\\n')"
+    ],
+    "stdin": null
+  },
+  "events": [
+    {
+      "protocol_version": {
+        "major": 1,
+        "minor": 0
+      },
+      "request_id": "req-sandbox-eval-001",
+      "job_id": "job-sandbox-789",
+      "sequence": 1,
+      "event": {
+        "StdoutChunk": [
+          108, 105, 110, 101, 32, 48, 58, 32, 112, 97, 121, 108, 111, 97, 100, 10
+        ]
+      }
+    },
+    {
+      "protocol_version": {
+        "major": 1,
+        "minor": 0
+      },
+      "request_id": "req-sandbox-eval-001",
+      "job_id": "job-sandbox-789",
+      "sequence": 2,
+      "event": {
+        "Diagnostic": {
+          "limit_bytes": 1048576,
+          "observed_bytes": 2097152,
+          "limit_lines": 50000,
+          "observed_lines": 82000,
+          "artifact_id": "art-spill-trunc-001",
+          "fetchable": true,
+          "reason": "Job exceeded stream boundary limit of 1048576 bytes; output spilled to artifact"
+        }
+      }
+    },
+    {
+      "protocol_version": {
+        "major": 1,
+        "minor": 0
+      },
+      "request_id": "req-sandbox-eval-001",
+      "job_id": "job-sandbox-789",
+      "sequence": 3,
+      "event": "CancellationAck"
+    },
+    {
+      "protocol_version": {
+        "major": 1,
+        "minor": 0
+      },
+      "request_id": "req-sandbox-eval-001",
+      "job_id": "job-sandbox-789",
+      "sequence": 4,
+      "event": {
+        "Exit": "ForcedKill"
+      }
+    }
+  ],
+  "usage": {
+    "wall_time_ms": 5250,
+    "cpu_time_ms": 4820,
+    "memory_bytes": 83886080,
+    "bytes_written": 2097152,
+    "child_processes_spawned": 1
+  }
+}

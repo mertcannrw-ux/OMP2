@@ -1,0 +1,152 @@
+{
+  "root": {
+    "kind": "Box",
+    "props": {
+      "values": {
+        "border": true,
+        "padding_x": 1,
+        "padding_y": 0
+      }
+    },
+    "children": [
+      {
+        "kind": "Row",
+        "props": {
+          "values": {
+            "gap": 1
+          }
+        },
+        "children": [
+          {
+            "kind": "Badge",
+            "props": {
+              "values": {
+                "variant": "info",
+                "label": "TOOL"
+              }
+            },
+            "children": [],
+            "text": {
+              "runs": [
+                {
+                  "style": {
+                    "fg": {
+                      "Ansi256": 14
+                    },
+                    "bg": null,
+                    "modifier": {
+                      "bold": true,
+                      "dim": false,
+                      "italic": false,
+                      "underline": false,
+                      "inverse": false,
+                      "strikethrough": false
+                    }
+                  },
+                  "text": "[Read]"
+                }
+              ]
+            }
+          },
+          {
+            "kind": "Text",
+            "props": {
+              "values": {
+                "wrap": false
+              }
+            },
+            "children": [],
+            "text": {
+              "runs": [
+                {
+                  "style": {
+                    "fg": null,
+                    "bg": null,
+                    "modifier": {
+                      "bold": true,
+                      "dim": false,
+                      "italic": false,
+                      "underline": false,
+                      "inverse": false,
+                      "strikethrough": false
+                    }
+                  },
+                  "text": "crates/omp-render/src/transcript.rs"
+                }
+              ]
+            }
+          }
+        ],
+        "text": null
+      },
+      {
+        "kind": "Callout",
+        "props": {
+          "values": {
+            "intent": "info",
+            "icon": "info"
+          }
+        },
+        "children": [
+          {
+            "kind": "Text",
+            "props": {
+              "values": {}
+            },
+            "children": [],
+            "text": {
+              "runs": [
+                {
+                  "style": {
+                    "fg": null,
+                    "bg": null,
+                    "modifier": {
+                      "bold": false,
+                      "dim": true,
+                      "italic": false,
+                      "underline": false,
+                      "inverse": false,
+                      "strikethrough": false
+                    }
+                  },
+                  "text": "Reading lines 1-150 (snapshot header [crates/omp-render/src/transcript.rs#9771])"
+                }
+              ]
+            }
+          }
+        ],
+        "text": null
+      },
+      {
+        "kind": "Pre",
+        "props": {
+          "values": {
+            "language": "rust",
+            "highlight": true
+          }
+        },
+        "children": [],
+        "text": {
+          "runs": [
+            {
+              "style": {
+                "fg": null,
+                "bg": null,
+                "modifier": {
+                  "bold": false,
+                  "dim": false,
+                  "italic": false,
+                  "underline": false,
+                  "inverse": false,
+                  "strikethrough": false
+                }
+              },
+              "text": "pub struct TranscriptScheduler {\n    pub blocks: Vec<TranscriptBlock>,\n    pub logical_history: LogicalHistory,\n    pub display_epoch: u64,\n}"
+            }
+          ]
+        }
+      }
+    ],
+    "text": null
+  }
+}

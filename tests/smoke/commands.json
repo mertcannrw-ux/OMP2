@@ -1,0 +1,42 @@
+[
+  {
+    "description": "Initialize a durable session with deterministic user message",
+    "command": "omp2 run --session-id smoke-session-1 --message \"Test initialization\" --profile default --json",
+    "expected_status": "created"
+  },
+  {
+    "description": "Resume the latest session from state directory",
+    "command": "omp2 resume --json",
+    "expected_status": "resumed"
+  },
+  {
+    "description": "Fork session at offset 1 into an isolated branch",
+    "command": "omp2 fork --offset 1 --json",
+    "expected_status": "forked"
+  },
+  {
+    "description": "Inspect session state tree in JSON format",
+    "command": "omp2 inspect --format json",
+    "expected_field": "tree"
+  },
+  {
+    "description": "Inspect session state tree in XML format",
+    "command": "omp2 inspect --format xml",
+    "expected_contains": "<root"
+  },
+  {
+    "description": "Validate journal integrity, checksums, and protocol compatibility",
+    "command": "omp2 doctor --json",
+    "expected_status": "healthy"
+  },
+  {
+    "description": "Replay branch ancestry offsets and record history",
+    "command": "omp2 replay --json",
+    "expected_status": "ok"
+  },
+  {
+    "description": "Verify explicit structured refusal on unsupported transport",
+    "command": "omp2 serve --transport unix --json",
+    "expected_error": "unsupported_transport"
+  }
+]
