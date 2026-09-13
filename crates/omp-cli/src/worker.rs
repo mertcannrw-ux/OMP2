@@ -39,6 +39,12 @@ pub enum WorkerEvent {
     Settled {
         error: Option<StructuredError>,
     },
+    /// Out-of-band failure that belongs to no submitted turn — a background
+    /// job/child poll that could not be committed, for instance. Presented as
+    /// a notice: unlike `Settled` it never claims an in-flight turn finished.
+    Diagnostic {
+        error: StructuredError,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +234,17 @@ fn append_diagnostic_if_possible(journal: &mut Journal, error: &StructuredError,
         }],
     };
     let _ = journal.append_patch(patch);
+}
+
+/// Report a failure from the idle-time job/child polling loop.
+///
+/// The poll happens outside any submitted turn, so the failure is recorded in
+/// the durable transcript when the journal still accepts writes and is always
+/// surfaced to the parent as a `Diagnostic` notice. Swallowing it would leave
+/// a job or subagent node stuck at `status=running` with no trace of why.
+fn report_poll_failure(journal: &mut Journal, owner: &ActorId, error: StructuredError) {
+    append_diagnostic_if_possible(journal, &error, owner);
+    let _ = emit_event(&WorkerEvent::Diagnostic { error });
 }
 
 fn reconcile_orphans(journal: &mut Journal, owner: &ActorId) -> Result<(), omp_state::StateError> {
@@ -504,8 +521,12 @@ pub fn run_worker(workspace: &Path, journal_path: &Path) -> Result<(), CliError>
 
     // 8. Main worker loop: poll background jobs & children while idle, handle requests promptly
     loop {
-        let _ = host.tool_host.poll_jobs(&mut journal);
-        let _ = host.poll_children(&mut journal);
+        if let Err(error) = host.tool_host.poll_jobs(&mut journal) {
+            report_poll_failure(&mut journal, &host.owner, error.into());
+        }
+        if let Err(error) = host.poll_children(&mut journal) {
+            report_poll_failure(&mut journal, &host.owner, error);
+        }
 
         match req_rx.recv_timeout(Duration::from_millis(25)) {
             Ok(Ok(WorkerRequest::Submit { line })) => {

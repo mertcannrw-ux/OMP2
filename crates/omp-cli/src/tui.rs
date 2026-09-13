@@ -213,6 +213,11 @@ pub fn run(
                     snapshot.selected_branch = branch;
                     dirty = true;
                 }
+                WorkerEvent::Diagnostic { error } => {
+                    dirty = true;
+                    notice_error = true;
+                    notice = format!("{}: {}", error.code, error.message);
+                }
                 WorkerEvent::Settled { error } => {
                     busy = false;
                     dirty = true;

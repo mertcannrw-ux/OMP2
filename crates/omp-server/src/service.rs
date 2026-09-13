@@ -4,7 +4,7 @@ use crate::role::{ActorRole, ActorSession, Permission};
 use omp_state::{Journal, SessionSnapshot};
 use omp_types::{
     ActorId, ArtifactId, BranchId, ElementId, ElementSnapshot, JobId, JournalOffset, Patch,
-    PatchOp, ProtocolVersion, SessionId, TypedValue,
+    PatchAuthor, PatchOp, ProtocolVersion, SessionId, TypedValue,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -281,7 +281,7 @@ impl ServerSessionService {
             let patch = Patch {
                 base_offset,
                 result_offset,
-                by: actor_id.into(),
+                by: PatchAuthor::Actor(actor_id.clone()),
                 reason: "attach actor".to_string(),
                 ops: vec![PatchOp::Create {
                     parent: actors_container.clone(),

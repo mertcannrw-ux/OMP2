@@ -7,9 +7,7 @@ use hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use omp_types::{
-    ActorId, ArtifactId, JobId, LimitPolicy, SessionId, StructuredError, ToolCallId,
-};
+use omp_types::{ActorId, ArtifactId, JobId, SessionId, StructuredError, ToolCallId};
 
 /// Validate that a content hash string is strictly 64 lowercase hexadecimal characters
 /// to prevent path traversal or malformed blob lookup.
@@ -616,6 +614,7 @@ impl ArtifactStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omp_types::LimitPolicy;
 
     #[test]
     fn test_disk_backed_hashed_storage_and_read() {

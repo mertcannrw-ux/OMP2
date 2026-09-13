@@ -241,18 +241,18 @@ fn extract_source_imports(source: &str) -> std::collections::BTreeSet<String> {
         let trimmed = code.trim();
         if let Some(rest) = trimmed.strip_prefix("import ") {
             for part in rest.split(',') {
-                let name = part.trim().split_whitespace().next().unwrap_or("");
+                let name = part.split_whitespace().next().unwrap_or("");
                 let name = name.trim_matches(|c| c == '(' || c == ')' || c == ';');
                 if !name.is_empty() {
                     imports.insert(name.to_string());
                 }
             }
-        } else if let Some(rest) = trimmed.strip_prefix("from ") {
-            if let Some((module, _)) = rest.split_once(" import ") {
-                let module = module.trim();
-                if !module.is_empty() && !module.starts_with('.') {
-                    imports.insert(module.to_string());
-                }
+        } else if let Some(rest) = trimmed.strip_prefix("from ")
+            && let Some((module, _)) = rest.split_once(" import ")
+        {
+            let module = module.trim();
+            if !module.is_empty() && !module.starts_with('.') {
+                imports.insert(module.to_string());
             }
         }
     }

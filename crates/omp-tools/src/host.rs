@@ -305,7 +305,12 @@ impl ToolHost {
         let mut ops = vec![PatchOp::SetAttribute {
             element: node_id.clone(),
             name: "workspace_diff".into(),
-            value: TypedValue::Json(serde_json::to_value(&diff).unwrap()),
+            value: TypedValue::Json(
+                serde_json::to_value(&diff).map_err(|error| ToolError::Execution {
+                    message: format!("Failed to serialize workspace diff: {error}"),
+                    details: None,
+                })?,
+            ),
         }];
         if matches!(
             state.termination_reason,
@@ -1460,7 +1465,10 @@ impl ToolHost {
                         lines.drain(start_idx..block_end);
                     }
                     EditOp::RemoveFile => {
-                        let _ = fs::remove_file(&resolved);
+                        fs::remove_file(&resolved).map_err(|e| ToolError::Execution {
+                            message: format!("Failed to delete file {}: {}", path, e),
+                            details: None,
+                        })?;
                         return Ok(HostResponse::success(format!("Deleted file {}", path)));
                     }
                     EditOp::MoveFile { destination } => {
@@ -1535,8 +1543,12 @@ impl ToolHost {
             reason: format!("Edit file: {} (new tag: #{})", path, new_tag),
             ops: vec![],
         };
-        let _ = journal.append_patch(patch);
-
+        journal
+            .append_patch(patch)
+            .map_err(|error| ToolError::Execution {
+                message: error.to_string(),
+                details: None,
+            })?;
         Ok(HostResponse::success(format!(
             "Applied edit to {} (new tag: #{})",
             path, new_tag
@@ -3032,6 +3044,41 @@ mod tests {
         assert!(read_res.output.content.contains("2:Line 2: World"));
         assert!(read_res.output.content.contains("3:Line 3: Foo"));
 
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn remove_file_reports_failure_when_the_os_refuses_deletion() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+        let temp_dir = std::env::temp_dir().join(format!("omp_test_host_rem_{}", ElementId::mint()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let mut journal = create_test_journal(&temp_dir);
+        let host = ToolHost::new(temp_dir.clone(), ActorId::new("test_user").unwrap()).unwrap();
+
+        // A handle that grants reads but withholds delete sharing makes
+        // `DeleteFile` fail with a sharing violation, so the host has to report
+        // the failure instead of claiming the file is gone.
+        let target = temp_dir.join("locked.txt");
+        fs::write(&target, "keep me\n").unwrap();
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&target)
+            .unwrap();
+
+        let result = host.handle_edit(&mut journal, "locked.txt", None, "[locked.txt#0000]\nREM\n");
+
+        assert!(
+            result.is_err(),
+            "deleting a file the OS refuses to delete must not report success"
+        );
+        assert!(target.exists(), "the file must still be on disk");
+
+        drop(lock);
         let _ = fs::remove_dir_all(&temp_dir);
     }
 

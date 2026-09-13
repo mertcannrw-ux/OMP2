@@ -560,7 +560,6 @@ impl Job {
                 )?;
             }
         }
-        let now = now_ms();
         let monotonic_elapsed = self.monotonic_start.elapsed();
         if monotonic_elapsed >= state.request.limits.max_wall_time
             && state.cancel_requested_ms.is_none()

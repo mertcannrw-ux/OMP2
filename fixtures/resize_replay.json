@@ -18,7 +18,10 @@
     ],
     "display_epoch": 1,
     "commit_frontier": 2,
-    "fail_stopped": false
+    "fail_stopped": false,
+    "total_elements": 2,
+    "rendered_elements": 2,
+    "scrollback_evicted": 0
   },
   "resize_event": {
     "target_width": 100,
@@ -62,7 +65,10 @@
     ],
     "display_epoch": 2,
     "commit_frontier": 2,
-    "fail_stopped": false
+    "fail_stopped": false,
+    "total_elements": 2,
+    "rendered_elements": 2,
+    "scrollback_evicted": 0
   },
   "logical_history_invariant_preserved": true,
   "write_failure_scenario": {
