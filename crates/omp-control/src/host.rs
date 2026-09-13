@@ -578,7 +578,15 @@ impl SessionHost {
         let provider_changed = effects.iter().any(|effect| matches!(effect,
             CommandEffect::ConVarUpdated { name, .. } if matches!(name.as_str(), "ai_provider" | "ai_endpoint" | "ai_api_key_env" | "ai_model")));
         if provider_changed {
-            self.provider_from_config(&staged_convars)?;
+            match self.provider_from_config(&staged_convars) {
+                Ok(_) => {}
+                // A missing credential is not a configuration error: the key can
+                // be exported later, and the failure surfaces when a turn needs
+                // it. Anything else (bad endpoint, unknown adapter) still fails
+                // the command.
+                Err(error) if Self::is_missing_credential(&error) => {}
+                Err(error) => return Err(error),
+            }
         }
         let mut ops = Vec::new();
         let convars_container = journal.snapshot().container("convars").clone();
@@ -711,8 +719,11 @@ impl SessionHost {
         self.refresh_provider()?;
         self.command_engine = staged_engine;
         self.director_stack = DirectorStack::from_session_snapshot(journal.snapshot())?;
-        if provider_changed {
-            self.initialize_provider(journal)?;
+        if provider_changed
+            && let Err(error) = self.initialize_provider(journal)
+            && !Self::is_missing_credential(&error)
+        {
+            return Err(error);
         }
         Ok(())
     }

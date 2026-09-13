@@ -1540,6 +1540,7 @@ fn extract_thinking_metadata(
         .or_else(|| val.pointer("/thinking/default_level"))
         .or_else(|| val.get("thinking_default"))
         .or_else(|| val.get("reasoning_effort_default"))
+        .or_else(|| val.get("default_reasoning_effort"))
         .and_then(|v| v.as_str())
         && !s.trim().is_empty() {
             default = Some(s.trim().to_string());
@@ -1553,6 +1554,7 @@ fn extract_thinking_metadata(
         .or_else(|| val.get("reasoning_effort"))
         .or_else(|| val.pointer("/supported_parameters/reasoning_effort"))
         .or_else(|| val.pointer("/parameters/reasoning_effort/enum"))
+        .or_else(|| val.get("supported_reasoning_efforts"))
         .and_then(|v| v.as_array())
     {
         let lvls: Vec<String> = lvl_arr
@@ -1577,9 +1579,13 @@ fn extract_thinking_metadata(
     }
 
     if supported.is_none()
-        && let Some(b) = val.get("thinking_supported").and_then(|v| v.as_bool()) {
-            supported = Some(b);
-        }
+        && let Some(b) = val
+            .get("thinking_supported")
+            .or_else(|| val.get("supports_reasoning"))
+            .and_then(|v| v.as_bool())
+    {
+        supported = Some(b);
+    }
 
     if supported.is_none() && (levels.is_some() || default.is_some()) {
         supported = Some(true);
@@ -2597,6 +2603,46 @@ mod tests {
         assert_eq!(minimal.thinking_supported, None);
         assert_eq!(minimal.thinking_default, None);
         assert_eq!(minimal.thinking_levels, None);
+    }
+
+    #[test]
+    fn test_catalog_parsing_gateway_field_names() {
+        // Gateways name the same facts differently: accept the common aliases
+        // rather than silently reporting "context unknown" for a whole catalog.
+        let json_val = serde_json::json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "gpt-6-astra",
+                    "object": "model",
+                    "owned_by": "theclawbay",
+                    "display_name": "GPT-6 Astra",
+                    "context_window": 272000,
+                    "supports_reasoning": true,
+                    "supported_reasoning_efforts": ["low", "medium", "high"],
+                    "default_reasoning_effort": "medium"
+                }
+            ]
+        });
+        let catalog = parse_models_catalog(&json_val).unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].id, "gpt-6-astra");
+        assert_eq!(
+            catalog[0].context_length,
+            Some(272_000),
+            "context_window is the same fact as context_length"
+        );
+        assert_eq!(
+            catalog[0].thinking_supported,
+            Some(true),
+            "supports_reasoning advertises thinking"
+        );
+        assert_eq!(
+            catalog[0].thinking_levels,
+            Some(vec!["low".into(), "medium".into(), "high".into()]),
+            "supported_reasoning_efforts is the level list"
+        );
+        assert_eq!(catalog[0].thinking_default.as_deref(), Some("medium"));
     }
 
     #[test]

@@ -375,7 +375,13 @@ impl SessionHost {
 
     // Rebuild transient state from the branch, without fetching on every turn/command.
     pub(crate) fn refresh_provider(&mut self) -> Result<(), StructuredError> {
-        let mut client = self.provider_from_config(&self.convars)?;
+        let mut client = match self.provider_from_config(&self.convars) {
+            Ok(client) => client,
+            // No credential means nothing to refresh here; the failure belongs
+            // to the turn that needs the provider, not to starting a session.
+            Err(error) if Self::is_missing_credential(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         if self.provider_injected {
             // Explicitly injected clients win until journal config takes over
             // (commit_provider clears the flag). An env- or convar-derived
@@ -479,6 +485,16 @@ impl SessionHost {
             )?;
         }
         Ok(())
+    }
+
+    /// True when the only thing wrong with the provider configuration is a
+    /// credential that has not been exported yet.
+    ///
+    /// Configuring a provider must not require its key to be present: the key
+    /// lives in the host environment and can be set afterwards, and the session
+    /// stays usable meanwhile. Work that actually needs the provider still fails.
+    pub fn is_missing_credential(error: &StructuredError) -> bool {
+        error.code == "missing_credentials"
     }
 
     pub fn initialize_provider(&mut self, journal: &mut Journal) -> Result<(), StructuredError> {

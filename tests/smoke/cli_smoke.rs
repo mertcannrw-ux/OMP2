@@ -107,27 +107,40 @@ fn create_temp_workspace(name: &str) -> PathBuf {
     dir
 }
 
-#[test]
-fn bare_command_creates_session_while_help_does_not() {
-    let workspace = create_temp_workspace("bare_command");
-    let mut command = Command::new(omp_binary());
-    command
-        .current_dir(&workspace)
-        .stdin(std::process::Stdio::null());
+/// Isolates a spawned `omp2` from the developer's machine: the user-wide
+/// config root (`~/.omp`) must not decide what these assertions see, and the
+/// provider environment is cleared so each scenario configures its own.
+fn isolated_command(binary: &std::path::Path, workspace: &std::path::Path) -> Command {
+    let mut command = Command::new(binary);
+    command.current_dir(workspace);
+    // A fresh home per invocation: no `~/.omp/config.cfg`, no cached journals.
+    let home = workspace.join(".smoke-home");
+    fs::create_dir_all(&home).expect("failed to create isolated home");
+    command.env("USERPROFILE", &home);
+    command.env("HOME", &home);
     for name in [
         "OMP_ENDPOINT",
-        "AI_ENDPOINT",
-        "OPENAI_BASE_URL",
-        "OMP_PROVIDER",
-        "AI_PROVIDER",
-        "OMP_MODEL",
-        "AI_MODEL",
         "OMP_API_KEY",
+        "OMP_PROVIDER",
+        "OMP_MODEL",
+        "AI_ENDPOINT",
+        "AI_PROVIDER",
+        "AI_MODEL",
+        "OPENAI_BASE_URL",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "OPENCODE_GO_API_KEY",
     ] {
         command.env_remove(name);
     }
+    command
+}
+
+#[test]
+fn bare_command_creates_session_while_help_does_not() {
+    let workspace = create_temp_workspace("bare_command");
+    let mut command = isolated_command(&omp_binary(), &workspace);
+    command.stdin(std::process::Stdio::null());
     let help = command.arg("--help").output().unwrap();
     assert!(help.status.success());
     assert!(!workspace.join(".omp").exists());
@@ -135,24 +148,8 @@ fn bare_command_creates_session_while_help_does_not() {
     // redirecting this isolated CLI scenario's journal into another workspace.
     fs::create_dir(workspace.join(".omp")).unwrap();
 
-    let mut command = Command::new(omp_binary());
-    command
-        .current_dir(&workspace)
-        .stdin(std::process::Stdio::null());
-    for name in [
-        "OMP_ENDPOINT",
-        "AI_ENDPOINT",
-        "OPENAI_BASE_URL",
-        "OMP_PROVIDER",
-        "AI_PROVIDER",
-        "OMP_MODEL",
-        "AI_MODEL",
-        "OMP_API_KEY",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-    ] {
-        command.env_remove(name);
-    }
+    let mut command = isolated_command(&omp_binary(), &workspace);
+    command.stdin(std::process::Stdio::null());
     let output = command.output().unwrap();
     assert!(
         output.status.success(),
@@ -180,7 +177,7 @@ fn test_all_seven_subcommands_lifecycle() {
     let (endpoint, provider) = scripted_provider();
 
     // 1. run subcommand
-    let run_output = Command::new(&bin)
+    let run_output = isolated_command(&bin, &ws)
         .env("OMP_ENDPOINT", &endpoint)
         .env("AI_PROVIDER", "openai_compatible")
         .env("AI_MODEL", "")
@@ -221,7 +218,7 @@ fn test_all_seven_subcommands_lifecycle() {
     );
 
     // 2. resume subcommand
-    let resume_output = Command::new(&bin)
+    let resume_output = isolated_command(&bin, &ws)
         .env("OMP_API_KEY", "local-smoke-only")
         .args([
             "resume",
@@ -245,7 +242,7 @@ fn test_all_seven_subcommands_lifecycle() {
     assert_eq!(resume_val["session_id"], "smoke-sess-1");
     assert_eq!(resume_val["turn_count"], 1);
     provider.join().unwrap();
-    let inspected = Command::new(&bin)
+    let inspected = isolated_command(&bin, &ws)
         .args([
             "inspect",
             "--workspace",
@@ -263,7 +260,7 @@ fn test_all_seven_subcommands_lifecycle() {
     assert_eq!(settings["ai_max_tokens"]["Integer"], 16000);
 
     // 3. fork subcommand (requires --offset)
-    let fork_fail = Command::new(&bin)
+    let fork_fail = isolated_command(&bin, &ws)
         .args([
             "fork",
             "--workspace",
@@ -284,7 +281,7 @@ fn test_all_seven_subcommands_lifecycle() {
         "expected missing_offset error, got: {fork_fail_err}"
     );
 
-    let fork_ok = Command::new(&bin)
+    let fork_ok = isolated_command(&bin, &ws)
         .args([
             "fork",
             "--workspace",
@@ -309,7 +306,7 @@ fn test_all_seven_subcommands_lifecycle() {
     assert!(fork_val["branch"].is_string());
 
     // 4. inspect subcommand (JSON format)
-    let inspect_json = Command::new(&bin)
+    let inspect_json = isolated_command(&bin, &ws)
         .args([
             "inspect",
             "--workspace",
@@ -328,7 +325,7 @@ fn test_all_seven_subcommands_lifecycle() {
     assert!(inspect_val.get("snapshot").is_some());
 
     // 4b. inspect subcommand (XML format)
-    let inspect_xml = Command::new(&bin)
+    let inspect_xml = isolated_command(&bin, &ws)
         .args([
             "inspect",
             "--workspace",
@@ -345,7 +342,7 @@ fn test_all_seven_subcommands_lifecycle() {
     assert!(xml_str.contains("<root") && xml_str.contains("</root>"));
 
     // 5. doctor subcommand
-    let doctor_out = Command::new(&bin)
+    let doctor_out = isolated_command(&bin, &ws)
         .args([
             "doctor",
             "--workspace",
@@ -363,7 +360,7 @@ fn test_all_seven_subcommands_lifecycle() {
     assert_eq!(doc_val["protocol_ok"], true);
 
     // 6. replay subcommand
-    let replay_out = Command::new(&bin)
+    let replay_out = isolated_command(&bin, &ws)
         .args([
             "replay",
             "--workspace",
@@ -381,7 +378,7 @@ fn test_all_seven_subcommands_lifecycle() {
     assert!(replay_val["ancestry_offsets"].is_array());
 
     // 7. serve subcommand (unsupported transport check)
-    let serve_unsupported = Command::new(&bin)
+    let serve_unsupported = isolated_command(&bin, &ws)
         .args([
             "serve",
             "--workspace",
@@ -403,7 +400,7 @@ fn test_all_seven_subcommands_lifecycle() {
     );
 
     // 8. path policy rejection of ambiguous paths
-    let ambiguous_run = Command::new(&bin)
+    let ambiguous_run = isolated_command(&bin, &ws)
         .args(["run", "--journal", "ambiguous*glob.journal"])
         .output()
         .expect("failed to spawn omp2 with ambiguous path");
