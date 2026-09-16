@@ -5,6 +5,9 @@ use omp_types::{ActorId, JournalOffset, Patch};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+pub const MAX_SUBSCRIBE_CAPACITY: usize = 4096;
+pub const MIN_SUBSCRIBE_CAPACITY: usize = 16;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ReplicationMessage {
     Resync {
@@ -45,12 +48,13 @@ impl SubscriberQueue {
         last_offset: JournalOffset,
         capacity: usize,
     ) -> Self {
+        let capacity = capacity.clamp(MIN_SUBSCRIBE_CAPACITY, MAX_SUBSCRIBE_CAPACITY);
         Self {
             actor_id,
             role,
             last_acknowledged_offset: last_offset,
-            capacity: capacity.max(16),
-            queue: VecDeque::with_capacity(capacity.max(16)),
+            capacity,
+            queue: VecDeque::new(),
             dropped_presentation_count: 0,
             needs_resync: false,
         }
@@ -327,5 +331,17 @@ mod tests {
             q.pop().is_none(),
             "No post-gap patch may escape before resync"
         );
+    }
+
+    #[test]
+    fn subscribe_capacity_is_clamped_and_lazy() {
+        let q = SubscriberQueue::new(
+            ActorId::new("sub-cap").unwrap(),
+            ActorRole::Spectator,
+            JournalOffset(0),
+            usize::MAX,
+        );
+        assert_eq!(q.capacity, MAX_SUBSCRIBE_CAPACITY);
+        assert!(q.queue.capacity() < 1024);
     }
 }

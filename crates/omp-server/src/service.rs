@@ -117,7 +117,6 @@ impl ServerSessionService {
     pub fn new(journal: Journal) -> Self {
         let session_id = journal.snapshot().session_id.clone();
         let mut seen_command_ids = BTreeSet::new();
-        let mut actors = BTreeMap::new();
 
         // Replay protection is session-wide across branches, including accepted
         // commands whose execution was interrupted after durable admission.
@@ -125,50 +124,17 @@ impl ServerSessionService {
             for op in &record.patch.ops {
                 if let PatchOp::Create { element, .. } = op
                     && element.kind == "command_receipt"
-                        && let Some(TypedValue::String(id)) = element.attributes.get("command_id") {
-                            seen_command_ids.insert(id.clone());
-                        }
-            }
-        }
-
-        // Restore actors from journal snapshot <actors> container
-        let actors_container = journal.snapshot().container("actors");
-        for elem in journal.snapshot().children(actors_container) {
-            let actor_str = match elem.attributes.get("actor_id") {
-                Some(TypedValue::String(s)) => s.clone(),
-                _ => elem
-                    .id
-                    .as_str()
-                    .strip_prefix("actor-")
-                    .unwrap_or(elem.id.as_str())
-                    .to_string(),
-            };
-            if let Ok(actor_id) = ActorId::new(&actor_str) {
-                let role = match elem.attributes.get("role") {
-                    Some(TypedValue::String(r)) => match r.as_str() {
-                        "Controller" => ActorRole::Controller,
-                        "InteractiveDriver" => ActorRole::InteractiveDriver,
-                        "Spectator" => ActorRole::Spectator,
-                        "SubagentInspector" => ActorRole::SubagentInspector,
-                        "AutomationWorker" => ActorRole::AutomationWorker,
-                        _ => ActorRole::Spectator,
-                    },
-                    _ => ActorRole::Spectator,
-                };
-                let attached_at_epoch_ms = match elem.attributes.get("attached_at_epoch_ms") {
-                    Some(TypedValue::Integer(ms)) => *ms as u64,
-                    _ => 0,
-                };
-                let mut session = ActorSession::new(actor_id.clone(), role);
-                session.attached_at_epoch_ms = attached_at_epoch_ms;
-                actors.insert(actor_id, session);
+                    && let Some(TypedValue::String(id)) = element.attributes.get("command_id")
+                {
+                    seen_command_ids.insert(id.clone());
+                }
             }
         }
 
         Self {
             session_id,
             journal,
-            actors,
+            actors: BTreeMap::new(),
             subscribers: BTreeMap::new(),
             seen_command_ids,
             default_queue_capacity: 128,
@@ -218,11 +184,8 @@ impl ServerSessionService {
             )
             .map_err(|error| ServerError::HandshakeFailed(error.to_string()))?;
 
-        let mut session = ActorSession::new(req.actor_id.clone(), req.requested_role);
-        if let Some(tok) = req.auth_token {
-            session = session.with_token(tok);
-        }
-        session = session.with_capabilities(req.capabilities.clone());
+        let session = ActorSession::new(req.actor_id.clone(), req.requested_role)
+            .with_capabilities(req.capabilities.clone());
 
         let granted_role = session.role;
         let capabilities = session.capabilities.clone();
@@ -239,9 +202,11 @@ impl ServerSessionService {
 
     pub fn attach_actor(&mut self, actor: ActorSession) -> Result<(), ServerError> {
         let actor_id = actor.actor_id.clone();
+        if self.actors.contains_key(&actor_id) {
+            return Err(ServerError::ActorAlreadyAttached(actor_id.to_string()));
+        }
         let role = actor.role;
         let attached_at = actor.attached_at_epoch_ms;
-
         // Durably journal actor ownership in <actors> container if not already recorded.
         // The journal write happens BEFORE the in-memory insert so a failure
         // cannot leave the two diverged in either direction.
@@ -429,7 +394,7 @@ impl ServerSessionService {
     pub fn submit_patch(
         &mut self,
         actor_id: &ActorId,
-        patch: Patch,
+        mut patch: Patch,
     ) -> Result<JournalOffset, ServerError> {
         if self.terminated {
             return Err(ServerError::SessionTerminated(self.session_id.to_string()));
@@ -449,6 +414,7 @@ impl ServerSessionService {
         patch
             .validate()
             .map_err(|e| ServerError::InvalidPatch(e.to_string()))?;
+        patch.by = PatchAuthor::Actor(actor_id.clone());
 
         self.submit_patch_internal(patch)
     }
@@ -565,8 +531,8 @@ impl ServerSessionService {
         if self.terminated {
             return Err(ServerError::SessionTerminated(self.session_id.to_string()));
         }
-
-        let _actor = self.get_actor(requester)?;
+        let actor = self.get_actor(requester)?;
+        actor.check_permission(Permission::SubmitCommand)?;
 
         let trimmed_id = request_id.trim();
         if trimmed_id.is_empty() {
@@ -2015,6 +1981,39 @@ mod tests {
             .unwrap_err();
         assert!(matches!(patch_err, ServerError::Unauthorized { .. }));
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn handshake_rejects_already_attached_actor() {
+        let (journal, path) = temp_journal();
+        let mut service = ServerSessionService::new(journal);
+        let driver_id = ActorId::new("driver-dup").unwrap();
+        let req = HandshakeRequest {
+            protocol_version: ProtocolVersion::CURRENT,
+            actor_id: driver_id.clone(),
+            requested_role: ActorRole::InteractiveDriver,
+            auth_token: None,
+            capabilities: vec![omp_types::JOURNAL_FORMAT.to_owned()],
+        };
+        service.handshake(req.clone()).unwrap();
+        let err = service.handshake(req).unwrap_err();
+        assert!(matches!(err, ServerError::ActorAlreadyAttached(_)));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn spectator_cannot_request_approval() {
+        let (journal, path) = temp_journal();
+        let mut service = ServerSessionService::new(journal);
+        let spec_id = ActorId::new("spec-approval").unwrap();
+        service
+            .attach_actor(ActorSession::new(spec_id.clone(), ActorRole::Spectator))
+            .unwrap();
+        let err = service
+            .request_approval(&spec_id, "approval-1", "read https://example.com")
+            .unwrap_err();
+        assert!(matches!(err, ServerError::Unauthorized { .. }));
         let _ = fs::remove_file(path);
     }
 }

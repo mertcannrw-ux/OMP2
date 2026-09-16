@@ -1,5 +1,5 @@
 use crate::error::ServerError;
-use crate::role::{ActorRole, Permission};
+use crate::role::{ActorRole, ActorSession, Permission};
 use crate::service::{
     ArtifactRecord, HandshakeRequest, ServerSessionService,
 };
@@ -113,7 +113,7 @@ fn journal_token_path(journal: &Journal) -> PathBuf {
     path
 }
 
-/// Persist auth tokens to `path` with owner-only permissions (0600 on unix).
+/// Persist auth tokens to `path` with owner-only permissions.
 /// Tokens are never printed to stdout; clients read this file instead.
 fn write_token_file(path: &PathBuf, auth_config: &AuthConfig) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -127,7 +127,6 @@ fn write_token_file(path: &PathBuf, auth_config: &AuthConfig) -> std::io::Result
     });
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
-    // The token file lives next to the journal, which is already host-private.
     #[cfg(unix)]
     options.mode(0o600);
     let mut file = options.open(path)?;
@@ -138,7 +137,90 @@ fn write_token_file(path: &PathBuf, auth_config: &AuthConfig) -> std::io::Result
         serde_json::to_string_pretty(&payload).unwrap_or_default()
     )?;
     file.sync_all()?;
+    drop(file);
+    restrict_token_file_acl(path)?;
     Ok(())
+}
+
+fn restrict_token_file_acl(path: &PathBuf) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        restrict_token_file_acl_windows(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn restrict_token_file_acl_windows(path: &PathBuf) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_FILE_OBJECT, SDDL_REVISION_1,
+        SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PSECURITY_DESCRIPTOR,
+    };
+    let mut path_w: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let sddl: Vec<u16> = "D:P(A;;FA;;;OW)"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut sec_desc: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let ok = ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut sec_desc,
+            std::ptr::null_mut(),
+        );
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut dacl_present = 0;
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut dacl_defaulted = 0;
+        GetSecurityDescriptorDacl(sec_desc, &mut dacl_present, &mut dacl, &mut dacl_defaulted);
+        let apply = if dacl_present != 0 {
+            SetNamedSecurityInfoW(
+                path_w.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | 0x8000_0000,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null_mut(),
+            )
+        } else {
+            LocalFree(sec_desc as *mut _);
+            return Err(std::io::Error::other("token DACL missing"));
+        };
+        LocalFree(sec_desc as *mut _);
+        if apply != 0 {
+            Err(std::io::Error::from_raw_os_error(apply as i32))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct TokenFileGuard(PathBuf);
+impl Drop for TokenFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Shared authoritative server state, wrapped in a single Mutex.
@@ -979,20 +1061,47 @@ fn handle_connection(
                     .unwrap_or(auth_actor_id.as_str());
                 match ActorId::new(target_str) {
                     Ok(target_id) => {
-                        let state_guard = match state.lock() {
-                            Ok(g) => g,
-                            Err(p) => p.into_inner(),
-                        };
-                        match state_guard.service.get_actor(&target_id) {
-                            Ok(actor) => serde_json::json!({
-                                "status": "ok",
-                                "actor": actor,
-                            }),
-                            Err(e) => serde_json::json!({
-                                "status": "error",
-                                "error": e.structured().code,
-                                "message": e.to_string(),
-                            }),
+                        if target_id != auth_actor_id {
+                            let checker = ActorSession::new(auth_actor_id.clone(), auth_role);
+                            if let Err(e) = checker.check_permission(Permission::ManageSession) {
+                                serde_json::json!({
+                                    "status": "error",
+                                    "error": e.structured().code,
+                                    "message": e.to_string(),
+                                })
+                            } else {
+                                let state_guard = match state.lock() {
+                                    Ok(g) => g,
+                                    Err(p) => p.into_inner(),
+                                };
+                                match state_guard.service.get_actor(&target_id) {
+                                    Ok(actor) => serde_json::json!({
+                                        "status": "ok",
+                                        "actor": actor,
+                                    }),
+                                    Err(e) => serde_json::json!({
+                                        "status": "error",
+                                        "error": e.structured().code,
+                                        "message": e.to_string(),
+                                    }),
+                                }
+                            }
+                        } else {
+                            let state_guard = match state.lock() {
+                                Ok(g) => g,
+                                Err(p) => p.into_inner(),
+                            };
+                            match state_guard.service.get_actor(&target_id) {
+                                Ok(actor) => serde_json::json!({
+                                    "status": "ok",
+                                    "actor": actor,
+                                }),
+                                Err(e) => serde_json::json!({
+                                    "status": "error",
+                                    "error": e.structured().code,
+                                    "message": e.to_string(),
+                                }),
+                            }
                         }
                     }
                     Err(e) => serde_json::json!({
@@ -1128,6 +1237,11 @@ fn handle_connection(
             break;
         }
     }
+    if let Some((actor_id, _)) = conn_state.authenticated
+        && let Ok(mut guard) = state.lock()
+    {
+        let _ = guard.service.detach_actor(&actor_id, &actor_id);
+    }
 }
 
 /// Publishes the authoritative TCP JSON newline transport service.
@@ -1152,13 +1266,6 @@ pub fn serve(
             serde_json::to_string(&error).unwrap_or_else(|_| r#"{"code":"provider_init"}"#.into())
         );
     }
-    if let Err(error) = write_token_file(&token_path, &auth_config) {
-        return Err(StructuredError::new(
-            "token_store",
-            format!("Failed to persist auth tokens: {error}"),
-            false,
-        ));
-    }
     let service = ServerSessionService::new(journal);
 
     let state = Arc::new(Mutex::new(ServerState {
@@ -1170,6 +1277,14 @@ pub fn serve(
     let listener = TcpListener::bind(bind).map_err(|e| {
         StructuredError::new("bind_error", format!("Failed to bind '{bind}': {e}"), false)
     })?;
+    if let Err(error) = write_token_file(&token_path, &auth_config) {
+        return Err(StructuredError::new(
+            "token_store",
+            format!("Failed to persist auth tokens: {error}"),
+            false,
+        ));
+    }
+    let _token_guard = TokenFileGuard(token_path.clone());
     let local_addr = listener.local_addr().map_err(|e| {
         StructuredError::new(
             "addr_error",
@@ -1300,12 +1415,6 @@ pub fn serve(
     dispatcher.shutdown(service.journal_mut())?;
     service.replicate(start);
     drop(guard);
-
-    // Best-effort cleanup: dead tokens must not linger after shutdown.
-    // (A crash may leave the file behind; its tokens are useless without
-    // the server, and the next `serve` overwrites them.)
-    let _ = std::fs::remove_file(&token_path);
-
     Ok(())
 }
 

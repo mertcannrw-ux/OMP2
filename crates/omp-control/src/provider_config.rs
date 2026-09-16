@@ -468,14 +468,10 @@ impl SessionHost {
             .get_typed::<String>("ai_api_key_env")
             .unwrap_or_default();
         if !key_env.is_empty() {
-            if !key_env
-                .bytes()
-                .enumerate()
-                .all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit()))
-            {
+            if !crate::command::is_allowed_key_env(&key_env) {
                 return Err(StructuredError::new(
                     "invalid_key_reference",
-                    "Use a host environment variable name, not an API key",
+                    "Use a known host API key environment variable (OMP_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENAI_COMPATIBLE_API_KEY)",
                     false,
                 ));
             }

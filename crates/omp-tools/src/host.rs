@@ -25,8 +25,8 @@ use omp_types::{
 
 use crate::autoqa::{AutoQaReport, ReportQualityFilter};
 use crate::definition::{
-    HostGateway, HostRequest, HostResponse, ToolCall,
-    ToolDefinition, ToolDiagnostic, ToolError, ToolExecutionResult, ToolLimits,
+    HostGateway, HostRequest, HostResponse, ToolCall, ToolDefinition, ToolDiagnostic, ToolError,
+    ToolExecutionResult,
 };
 use crate::dyn_discovery::DynamicTool;
 use crate::edit::{EditOp, HashlineParser};
@@ -2131,8 +2131,15 @@ impl ToolHost {
             self.handle_python_request(journal, &worker_id, request)
         });
         self.python_session = Some(session);
+        if let Some(session) = &self.python_session
+            && let Err(error) = session.workspace_view.apply_to_base()
+        {
+            return Err(ToolError::Execution {
+                message: format!("Failed to merge eval workspace: {error}"),
+                details: None,
+            });
+        }
         let eval_result = result.map_err(ToolError::Structured)?;
-
         // Format result from JSON response
         let status = eval_result
             .get("status")
@@ -2192,7 +2199,7 @@ impl ToolHost {
     fn handle_python_request(
         &mut self,
         journal: &mut Journal,
-        worker_id: &ElementId,
+        _worker_id: &ElementId,
         request: serde_json::Value,
     ) -> Result<serde_json::Value, StructuredError> {
         let invalid = |message: &str| StructuredError::new("sdk_request", message, false);
@@ -2237,19 +2244,11 @@ impl ToolHost {
                         .map_err(|error| invalid(&error.to_string()))?;
                     Ok(json!({"content":response.output.content,"payload":response.output.payload}))
                 }
-                Some("dyn") => {
-                    let params = &request["params"];
-                    let response = self
-                        .handle_dyn_lookup(
-                            journal,
-                            params["query"].as_str(),
-                            params["action"].as_str(),
-                            params["help"].as_bool().unwrap_or(false),
-                            params.get("args").cloned(),
-                        )
-                        .map_err(|error| invalid(&error.to_string()))?;
-                    Ok(json!({"content":response.output.content,"payload":response.output.payload}))
-                }
+                Some("dyn") => Err(StructuredError::new(
+                    "capability_denied",
+                    "Dynamic tool lookup is not granted to eval workers",
+                    false,
+                )),
                 _ => Err(StructuredError::new(
                     "capability_denied",
                     "This worker query requires a host control capability",
@@ -2319,124 +2318,11 @@ impl ToolHost {
                     .map_err(|error| error.structured())?;
                 Ok(json!({"offset":journal.snapshot().offset}))
             }
-            Some("register") => {
-                if request["directors"]
-                    .as_array()
-                    .is_some_and(|items| !items.is_empty())
-                    || request["components"]
-                        .as_array()
-                        .is_some_and(|items| !items.is_empty())
-                {
-                    return Err(StructuredError::new(
-                        "capability_denied",
-                        "Custom Director and component execution requires a host registration capability",
-                        false,
-                    ));
-                }
-                let extension = request["extension_id"]
-                    .as_str()
-                    .ok_or_else(|| invalid("Extension identifier required"))?;
-                let valid_name = |name: &str| {
-                    !name.is_empty()
-                        && name.len() <= 64
-                        && name
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-                };
-                if !valid_name(extension) {
-                    return Err(invalid("Invalid extension namespace"));
-                }
-                let declarations: Vec<omp_python::protocol::ToolDeclaration> =
-                    serde_json::from_value(request["tools"].clone())
-                        .map_err(|error| invalid(&error.to_string()))?;
-                if declarations.len() > 32 {
-                    return Err(invalid("Extension declaration budget exceeded"));
-                }
-                let mut definitions = BTreeMap::new();
-                let mut ops = Vec::new();
-                let mut index = journal.snapshot().active_tool_roster().count();
-                for node in journal.snapshot().active_tool_roster() {
-                    if node.attributes.get("extension")
-                        == Some(&TypedValue::String(extension.into()))
-                    {
-                        ops.push(PatchOp::Delete {
-                            element: node.id.clone(),
-                        });
-                        index -= 1;
-                    }
-                }
-                for declaration in declarations {
-                    if !valid_name(&declaration.name)
-                        || declaration.version.is_empty()
-                        || declaration.parameter_schema["type"] != "object"
-                    {
-                        return Err(invalid(
-                            "Tools require a valid action, version, and object parameter schema",
-                        ));
-                    }
-                    let name = format!("{extension}/{}", declaration.name);
-                    if definitions.contains_key(&name)
-                        || journal.snapshot().active_tool_roster().any(|node| {
-                            node.attributes.get("name") == Some(&TypedValue::String(name.clone()))
-                                && node.attributes.get("extension")
-                                    != Some(&TypedValue::String(extension.into()))
-                        })
-                    {
-                        return Err(invalid("Conflicting dynamic tool declaration"));
-                    }
-                    let mut node = ElementSnapshot::new(ElementId::mint(), "tool");
-                    node.attributes
-                        .insert("name".into(), TypedValue::String(name.clone()));
-                    node.attributes.insert(
-                        "version".into(),
-                        TypedValue::String(declaration.version.clone()),
-                    );
-                    node.attributes.insert(
-                        "description".into(),
-                        TypedValue::String(declaration.description.clone()),
-                    );
-                    node.attributes
-                        .insert("worker".into(), TypedValue::String(worker_id.to_string()));
-                    node.attributes
-                        .insert("extension".into(), TypedValue::String(extension.into()));
-                    node.payload = Some(declaration.parameter_schema.clone());
-                    ops.push(PatchOp::Create {
-                        parent: journal.snapshot().container("tools").clone(),
-                        index: index as u32,
-                        element: node,
-                    });
-                    index += 1;
-                    let executor = Arc::new(PythonToolExecutor { name: name.clone() });
-                    definitions.insert(
-                        name.clone(),
-                        ToolDefinition::new(
-                            name,
-                            declaration.version,
-                            json!({"type":"string"}),
-                            declaration.parameter_schema,
-                            vec![],
-                            ToolLimits::default(),
-                            executor,
-                            declaration.description,
-                        ),
-                    );
-                }
-                if !ops.is_empty() {
-                    journal
-                        .append_patch(Patch {
-                            base_offset: JournalOffset(journal.snapshot().offset),
-                            result_offset: journal.next_offset(),
-                            by: self.owner.clone().into(),
-                            reason: "publish extension declarations".into(),
-                            ops,
-                        })
-                        .map_err(|error| error.structured())?;
-                }
-                for definition in definitions.into_values() {
-                    self.registry.register_dynamic(definition);
-                }
-                Ok(json!({"registered":extension}))
-            }
+            Some("register") => Err(StructuredError::new(
+                "capability_denied",
+                "Extension registration is not granted to eval workers",
+                false,
+            )),
             Some("job") if request["operation"] == "execute_remote" => {
                 let payload = &request["payload"];
                 let source = payload["source_code"]
@@ -2943,29 +2829,6 @@ impl<'a> HostGateway for LiveHostGateway<'a> {
     }
 }
 
-struct PythonToolExecutor {
-    name: String,
-}
-impl crate::definition::ToolExecutor for PythonToolExecutor {
-    fn execute(
-        &self,
-        call: &ToolCall,
-        gateway: &dyn HostGateway,
-    ) -> Result<ToolExecutionResult, ToolError> {
-        let code = format!(
-            "__import__('omp_sdk.protocol', fromlist=['invoke_tool']).invoke_tool({}, __import__('json').loads({}))",
-            serde_json::to_string(&self.name).unwrap(),
-            serde_json::to_string(&call.input.to_string()).unwrap()
-        );
-        let response = gateway.request(HostRequest::EvalCode {
-            code,
-            language: "py".into(),
-            reset: false,
-            timeout_ms: None,
-        })?;
-        Ok(ToolExecutionResult::from_host(response))
-    }
-}
 /// True when a patch section's path targets the file being edited: exact
 /// match, or a suffix match only at a path-separator boundary so
 /// `a/foo.rs` can never satisfy an edit intended for `b/foo.rs`.
@@ -3740,60 +3603,27 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn extension_tools_follow_rewind_reload_and_worker_reset() {
+    fn eval_workers_cannot_register_extension_tools() {
         let root = std::env::temp_dir().join(format!("omp-extension-{}", ElementId::mint()));
         fs::create_dir_all(root.join("source")).unwrap();
         let mut journal = create_test_journal(&root);
         let mut host = ToolHost::new(root.join("source"), ActorId::mint()).unwrap();
         let load = "from omp_sdk.examples import StatefulTodoExtension\nfrom omp_sdk.extension import ExtensionContext\nfrom omp_sdk.protocol import StreamTransport\nt = StreamTransport()\next = StatefulTodoExtension(t)\next.on_load(ExtensionContext(ext.extension_id, t))";
-        let before = journal.snapshot().offset;
         let response = host
             .handle_eval(&mut journal, load, "py", false, Some(5000))
             .unwrap();
+        let denied = response.diagnostics.iter().any(|diag| {
+            diag.message.contains("capability_denied")
+                || diag.message.contains("Extension registration")
+        }) || response.output.content.contains("capability_denied")
+            || response.output.content.contains("Extension registration");
+        assert!(denied, "{:?} {}", response.diagnostics, response.output.content);
         assert!(
-            response.diagnostics.is_empty(),
-            "{:?}",
-            response.diagnostics
-        );
-        let name = "stateful_todo_example/todo_counter";
-        let invoke = ToolCall::new(
-            omp_types::ToolCallId::mint(),
-            name,
-            "1.0.0",
-            json!({"title":"durable tool item","i":"Adding item"}),
-        );
-        let result = host.execute_tool(&mut journal, &invoke).unwrap();
-        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-        assert!(
-            journal
+            !journal
                 .snapshot()
-                .active_todos()
-                .any(|node| node.text == "durable tool item")
+                .active_tool_roster()
+                .any(|node| node.attributes.get("extension").is_some())
         );
-        let response = host
-            .handle_eval(&mut journal, "ext.on_reload()", "py", false, Some(5000))
-            .unwrap();
-        assert!(
-            response.diagnostics.is_empty(),
-            "{:?}",
-            response.diagnostics
-        );
-        assert_eq!(journal.snapshot().active_tool_roster().filter(|node| node.attributes.get("name") == Some(&TypedValue::String(name.into()))).count(), 1);
-        journal.rewind_to(before).unwrap();
-        assert!(host.execute_tool(&mut journal, &invoke).is_err());
-        assert!(
-            !host
-                .handle_dyn_lookup(&mut journal, None, None, false, None)
-                .unwrap()
-                .output
-                .content
-                .contains(name)
-        );
-        host.handle_eval(&mut journal, load, "py", false, Some(5000))
-            .unwrap();
-        host.handle_eval(&mut journal, "42", "py", true, Some(5000))
-            .unwrap();
-        assert!(host.execute_tool(&mut journal, &invoke).is_err());
         host.shutdown_jobs(&mut journal).unwrap();
         drop(host);
         drop(journal);

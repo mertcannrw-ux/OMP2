@@ -534,7 +534,17 @@ impl SessionHost {
                 Ok(source)
             })
             .map_err(|e| e.to_structured_error())?;
-
+        if effects.iter().any(|effect| match effect {
+            CommandEffect::ExecRequested { path } => self.cfg_path_is_untrusted(path),
+            _ => false,
+        }) && effects.iter().any(effect_sets_host_secrets)
+        {
+            return Err(StructuredError::new(
+                "untrusted_cfg_secrets",
+                "Workspace configuration cannot set provider endpoints or API key environment variables; put those in ~/.omp",
+                false,
+            ));
+        }
         let external = effects
             .iter()
             .filter(|effect| {
@@ -1334,6 +1344,36 @@ impl SessionHost {
         }
 
         Ok(())
+    }
+
+    fn cfg_path_is_untrusted(&self, path: &str) -> bool {
+        let path = std::path::Path::new(path);
+        let Ok(canon) = path.canonicalize() else {
+            return false;
+        };
+        let Ok(root) = self.workspace.canonicalize() else {
+            return true;
+        };
+        if !canon.starts_with(&root) {
+            return false;
+        }
+        !self.extra_config_roots.iter().any(|extra| {
+            extra
+                .canonicalize()
+                .ok()
+                .is_some_and(|trusted| canon.starts_with(&trusted))
+        })
+    }
+}
+
+fn effect_sets_host_secrets(effect: &CommandEffect) -> bool {
+    match effect {
+        CommandEffect::ConVarUpdated { name, .. } => matches!(
+            name.as_str(),
+            "ai_endpoint" | "ai_api_key_env" | "ai_provider" | "ai_provider_name"
+        ),
+        CommandEffect::Provider { .. } => true,
+        _ => false,
     }
 }
 

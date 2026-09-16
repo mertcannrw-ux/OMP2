@@ -117,6 +117,7 @@ mod windows_impl {
 
             // Create AppContainer sandbox with Lowbox token and no network capability
             let mut sandbox = AppContainerSandbox::create(cwd, allow_network)?;
+            sandbox.deny_isolated_host_state(&cwd.join(".omp"))?;
 
             // Grant read/execute access to external binary if located outside cwd and system paths.
             // This is recorded as a tracked grant and automatically restored on drop.

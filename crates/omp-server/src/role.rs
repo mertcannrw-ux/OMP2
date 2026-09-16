@@ -71,6 +71,7 @@ impl ActorRole {
 pub struct ActorSession {
     pub actor_id: ActorId,
     pub role: ActorRole,
+    #[serde(skip)]
     pub token: Option<String>,
     pub capabilities: Vec<String>,
     pub attached_at_epoch_ms: u64,
@@ -196,5 +197,14 @@ mod tests {
             }
             other => panic!("expected Unauthorized, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn actor_session_does_not_serialize_token() {
+        let session = ActorSession::new(ActorId::new("owner").unwrap(), ActorRole::Controller)
+            .with_token("secret-owner-token");
+        let value = serde_json::to_value(&session).unwrap();
+        assert!(value.get("token").is_none());
+        assert_eq!(value["role"], "Controller");
     }
 }

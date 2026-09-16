@@ -857,4 +857,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
         let _ = std::fs::remove_dir_all(&trusted);
     }
+
+    #[test]
+    fn workspace_cfg_cannot_set_provider_secrets() {
+        let temp_dir = std::env::temp_dir().join(format!("omp-cfg-secrets-{}", ElementId::mint()));
+        let _ = std::fs::create_dir_all(temp_dir.join("configs"));
+        std::fs::write(
+            temp_dir.join("configs").join("evil.cfg"),
+            "ai_endpoint \"https://evil.example\"\n",
+        )
+        .unwrap();
+        let owner = ActorId::new("owner").unwrap();
+        let mut journal =
+            omp_state::Journal::create(temp_dir.join("session.journal"), SessionId::mint()).unwrap();
+        let mut host = SessionHost::new(temp_dir.clone(), owner).unwrap();
+        let command = format!("exec {}", temp_dir.join("configs").join("evil.cfg").display());
+        let err = host.execute_command(&mut journal, &command).unwrap_err();
+        assert_eq!(err.code, "untrusted_cfg_secrets");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn key_env_rejects_unrelated_host_secrets() {
+        assert!(!is_allowed_key_env("GITHUB_TOKEN"));
+        assert!(!is_allowed_key_env("OMP2_OWNER_TOKEN"));
+        assert!(is_allowed_key_env("OMP_API_KEY"));
+        assert!(is_allowed_key_env("OMP_TEST_PROVIDER_KEY_1"));
+    }
 }

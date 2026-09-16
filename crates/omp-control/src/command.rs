@@ -47,6 +47,14 @@ fn endpoint_default_adapter(endpoint: &str) -> String {
     }
 }
 
+/// Host environment variables that may name a provider API key.
+pub fn is_allowed_key_env(name: &str) -> bool {
+    matches!(
+        name,
+        "OMP_API_KEY" | "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" | "OPENAI_COMPATIBLE_API_KEY"
+    ) || (name.starts_with("OMP_TEST_") && name.contains("KEY"))
+}
+
 /// Parses `--adapter/--key-env/--model` pairs shared by `add` and bare endpoint
 /// configuration. Credentials are never accepted, only the variable name.
 fn parse_provider_options(
@@ -64,7 +72,15 @@ fn parse_provider_options(
         }
         match pair[0].as_str() {
             "--adapter" => adapter = pair[1].clone(),
-            "--key-env" => key_env = pair[1].clone(),
+            "--key-env" => {
+                if !is_allowed_key_env(&pair[1]) {
+                    return Err(CommandError::Parse(
+                        "key-env must be OMP_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, or OPENAI_COMPATIBLE_API_KEY"
+                            .into(),
+                    ));
+                }
+                key_env = pair[1].clone();
+            }
             "--model" => model = Some(pair[1].clone()),
             _ => {
                 return Err(CommandError::Parse(

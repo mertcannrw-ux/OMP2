@@ -282,3 +282,29 @@ fn open_replays_a_long_journal_incrementally() {
     drop(reopened);
     fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn oversized_patch_does_not_poison_the_live_journal() {
+    let path = temp();
+    let mut j = Journal::create(&path, SessionId::mint()).unwrap();
+    let mut element = ElementSnapshot::new(ElementId::mint(), "tool");
+    element.text = "x".repeat(MAX_WIRE_BYTES);
+    let err = j
+        .append_patch(Patch {
+            base_offset: JournalOffset(j.snapshot().offset),
+            result_offset: j.next_offset(),
+            by: ActorId::mint().into(),
+            reason: "too large for a frame".into(),
+            ops: vec![PatchOp::Create {
+                parent: key("body"),
+                index: 0,
+                element,
+            }],
+        })
+        .unwrap_err();
+    assert!(matches!(err, StateError::Invalid(_)), "{err}");
+    put(&mut j, "body", "tool", "still writable");
+    assert_eq!(j.snapshot().offset, 1);
+    drop(j);
+    fs::remove_file(path).unwrap();
+}

@@ -113,11 +113,95 @@ impl Drop for TrackedDaclGrant {
     }
 }
 
-/// Represents an active Windows AppContainer profile with Lowbox token boundary.
-///
-/// Under the Windows security reference monitor, an AppContainer process is explicitly
-/// blocked from all system resources and filesystem paths unless granted via an ACE
-/// containing the AppContainer SID or `ALL_APPLICATION_PACKAGES`.
+/// Saved mandatory integrity label restored when the sandbox drops.
+#[derive(Debug)]
+struct IntegrityLabelRestore {
+    path: PathBuf,
+    sec_desc: PSECURITY_DESCRIPTOR,
+}
+
+unsafe impl Send for IntegrityLabelRestore {}
+
+impl IntegrityLabelRestore {
+    fn capture(path: &Path) -> Self {
+        let path_str = path.to_string_lossy();
+        let path_w = to_wide_null(&path_str);
+        let mut sacl: *mut ACL = null_mut();
+        let mut sec_desc: PSECURITY_DESCRIPTOR = null_mut();
+        const LABEL_SECURITY_INFORMATION: u32 = 0x00000010;
+        let res = unsafe {
+            GetNamedSecurityInfoW(
+                path_w.as_ptr(),
+                SE_FILE_OBJECT,
+                LABEL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut sacl,
+                &mut sec_desc,
+            )
+        };
+        if res != 0 || sec_desc.is_null() {
+            if !sec_desc.is_null() {
+                unsafe {
+                    LocalFree(sec_desc as *mut _);
+                }
+            }
+            Self {
+                path: path.to_path_buf(),
+                sec_desc: null_mut(),
+            }
+        } else {
+            Self {
+                path: path.to_path_buf(),
+                sec_desc,
+            }
+        }
+    }
+
+    fn restore(&mut self) {
+        let path_str = self.path.to_string_lossy();
+        let mut path_w = to_wide_null(&path_str);
+        const LABEL_SECURITY_INFORMATION: u32 = 0x00000010;
+        if self.sec_desc.is_null() {
+            let _ = set_integrity_sddl(&self.path, "S:(ML;OICI;NW;;;ME)");
+            return;
+        }
+        unsafe {
+            let mut sacl_present: BOOL = 0;
+            let mut sacl: *mut ACL = null_mut();
+            let mut sacl_defaulted: BOOL = 0;
+            GetSecurityDescriptorSacl(
+                self.sec_desc,
+                &mut sacl_present,
+                &mut sacl,
+                &mut sacl_defaulted,
+            );
+            if sacl_present != 0 && !sacl.is_null() {
+                let _ = SetNamedSecurityInfoW(
+                    path_w.as_mut_ptr(),
+                    SE_FILE_OBJECT,
+                    LABEL_SECURITY_INFORMATION,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    sacl,
+                );
+            } else {
+                let _ = set_integrity_sddl(&self.path, "S:(ML;OICI;NW;;;ME)");
+            }
+            LocalFree(self.sec_desc as *mut _);
+            self.sec_desc = null_mut();
+        }
+    }
+}
+
+impl Drop for IntegrityLabelRestore {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 #[derive(Debug)]
 pub struct AppContainerSandbox {
     profile_name: String,
@@ -125,9 +209,9 @@ pub struct AppContainerSandbox {
     cwd: PathBuf,
     network_allowed: bool,
     tracked_grants: Vec<TrackedDaclGrant>,
+    label_restore: Option<IntegrityLabelRestore>,
 }
 
-// PSID is a pointer to an OS-managed SID allocation.
 unsafe impl Send for AppContainerSandbox {}
 unsafe impl Sync for AppContainerSandbox {}
 
@@ -199,8 +283,9 @@ impl AppContainerSandbox {
             ));
         }
 
-        // Grant explicit read/write/execute/delete access on the isolated cwd to the AppContainer SID.
+        let label_restore = IntegrityLabelRestore::capture(cwd);
         if let Err(e) = grant_appcontainer_access(cwd, sid) {
+            drop(label_restore);
             let profile_name_w = to_wide_null(&profile_name);
             unsafe {
                 let _ = DeleteAppContainerProfile(profile_name_w.as_ptr());
@@ -215,7 +300,22 @@ impl AppContainerSandbox {
             cwd: cwd.to_path_buf(),
             network_allowed: false,
             tracked_grants: Vec::new(),
+            label_restore: Some(label_restore),
         })
+    }
+
+    /// Deny this AppContainer access to a host-state directory inside cwd (typically `.omp`).
+    pub fn deny_isolated_host_state(&mut self, path: &Path) -> Result<(), StructuredError> {
+        if !path.exists() {
+            std::fs::create_dir_all(path).map_err(|error| {
+                StructuredError::new(
+                    "host_state_dir",
+                    format!("Failed to create '{}': {error}", path.display()),
+                    false,
+                )
+            })?;
+        }
+        deny_appcontainer_access(path, self.sid)
     }
 
     /// Return the raw AppContainer SID.
@@ -294,14 +394,10 @@ impl AppContainerSandbox {
 
 impl Drop for AppContainerSandbox {
     fn drop(&mut self) {
-        // Drop tracked grants first to restore original DACLs on external files
         self.tracked_grants.clear();
 
         if !self.sid.is_null() {
-            // Revoke cwd permissions
             let _ = revoke_appcontainer_access(&self.cwd, self.sid);
-
-            // Delete profile
             let profile_name_w = to_wide_null(&self.profile_name);
             unsafe {
                 let _ = DeleteAppContainerProfile(profile_name_w.as_ptr());
@@ -309,6 +405,7 @@ impl Drop for AppContainerSandbox {
             }
             self.sid = null_mut();
         }
+        self.label_restore.take();
     }
 }
 
@@ -712,14 +809,10 @@ pub fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Apply a Low Mandatory Integrity Label (S:(ML;OICI;NW;;;LW)) to the path.
-///
-/// Ensures that Lowbox AppContainer processes can create and write files inside the
-/// designated working directory without being blocked by Windows Mandatory Integrity Control.
-pub fn set_low_mandatory_label(path: &Path) -> Result<(), StructuredError> {
+fn set_integrity_sddl(path: &Path, sddl: &str) -> Result<(), StructuredError> {
     let path_str = path.to_string_lossy();
     let mut path_w = to_wide_null(&path_str);
-    let sddl = to_wide_null("S:(ML;OICI;NW;;;LW)");
+    let sddl = to_wide_null(sddl);
 
     unsafe {
         let mut sec_desc: PSECURITY_DESCRIPTOR = null_mut();
@@ -782,6 +875,11 @@ pub fn set_low_mandatory_label(path: &Path) -> Result<(), StructuredError> {
         }
     }
     Ok(())
+}
+
+/// Apply a Low Mandatory Integrity Label (S:(ML;OICI;NW;;;LW)) to the path.
+pub fn set_low_mandatory_label(path: &Path) -> Result<(), StructuredError> {
+    set_integrity_sddl(path, "S:(ML;OICI;NW;;;LW)")
 }
 
 /// Grant the specified AppContainer SID full control over the target path via Windows DACL,

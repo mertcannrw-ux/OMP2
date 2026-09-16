@@ -1,7 +1,7 @@
 use crate::{SessionSnapshot, StateError, apply_patch};
 use omp_types::{
     ActorId, BranchId, ElementId, ElementSnapshot, JOURNAL_FORMAT, JournalOffset, MAX_WIRE_BYTES,
-    Patch, PatchAuthor, PatchOp, ProtocolVersion, SessionId, TypedValue,
+    PROTOCOL_MAJOR, Patch, PatchAuthor, PatchOp, ProtocolVersion, SessionId, TypedValue,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -138,7 +138,7 @@ impl Journal {
             &read_frame(&mut file)?
                 .ok_or_else(|| StateError::Invalid("missing journal header".into()))?,
         )?;
-        if header.format != JOURNAL_FORMAT || header.version != ProtocolVersion::CURRENT {
+        if header.format != JOURNAL_FORMAT || header.version.major != PROTOCOL_MAJOR {
             return Err(StateError::Invalid("journal protocol mismatch".into()));
         }
         let mut journal = Self {
@@ -202,7 +202,7 @@ impl Journal {
             || record.patch.result_offset.0 != record.offset
             || record.actor != record.patch.by
             || record.session_id != self.snapshot.session_id
-            || record.protocol_version != ProtocolVersion::CURRENT
+            || record.protocol_version.major != PROTOCOL_MAJOR
             || record.checksum != record.checksum()?
         {
             return Err(StateError::Invalid(
@@ -304,46 +304,60 @@ impl Journal {
             ));
         }
         let previous = self.snapshot.offset;
-        // Validation and mutation are transactional; no durable operation is acknowledged until sync.
-        apply_patch(&mut self.snapshot, &patch)?;
-        let result = (|| -> Result<JournalRecord, StateError> {
-            let mut record = JournalRecord {
-                offset: patch.result_offset.0,
-                timestamp_ms: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|e| StateError::Invalid(e.to_string()))?
-                    .as_millis() as u64,
-                session_id: self.snapshot.session_id.clone(),
-                branch_id: branch.clone(),
-                parent_offset: previous,
-                actor: patch.by.clone(),
-                patch,
-                protocol_version: ProtocolVersion::CURRENT,
-                checksum: String::new(),
-                causal: None,
-            };
-            record.checksum = record.checksum()?;
-            let bytes = serde_json::to_vec(&record)?;
+        let mut record = JournalRecord {
+            offset: patch.result_offset.0,
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| StateError::Invalid(e.to_string()))?
+                .as_millis() as u64,
+            session_id: self.snapshot.session_id.clone(),
+            branch_id: branch.clone(),
+            parent_offset: previous,
+            actor: patch.by.clone(),
+            patch,
+            protocol_version: ProtocolVersion::CURRENT,
+            checksum: String::new(),
+            causal: None,
+        };
+        record.checksum = record.checksum()?;
+        let bytes = serde_json::to_vec(&record)?;
+        if bytes.len() > MAX_WIRE_BYTES {
+            return Err(StateError::Invalid("journal frame limit".into()));
+        }
+        apply_patch(&mut self.snapshot, &record.patch)?;
+        let result = (|| -> Result<(), StateError> {
             self.file.seek(SeekFrom::End(0))?;
             write_frame(&mut self.file, &bytes)?;
             self.file.sync_all()?;
-            Ok(record)
+            Ok(())
         })();
         match result {
-            Ok(record) => {
+            Ok(()) => {
                 let offset = record.offset;
                 self.records.insert(offset, record);
                 self.snapshot.selected_branch = branch;
                 if let Some(observer) = &self.observer
-                    && let Some(rec) = self.records.get(&offset) {
-                        observer(rec, &self.snapshot);
-                    }
+                    && let Some(rec) = self.records.get(&offset)
+                {
+                    observer(rec, &self.snapshot);
+                }
                 Ok(offset)
             }
             Err(error) => {
-                self.snapshot = self.materialize(previous)?;
-                self.failed = true;
-                Err(error)
+                let poison = !matches!(error, StateError::Invalid(_));
+                match self.materialize(previous) {
+                    Ok(snapshot) => {
+                        self.snapshot = snapshot;
+                        if poison {
+                            self.failed = true;
+                        }
+                        Err(error)
+                    }
+                    Err(restore_error) => {
+                        self.failed = true;
+                        Err(restore_error)
+                    }
+                }
             }
         }
     }
